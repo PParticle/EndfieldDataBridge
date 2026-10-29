@@ -613,12 +613,27 @@ int FactionOf(void* ability) {
 }
 
 // ---- Shared memory (include/endfield_bridge.h) ----
-// Every change happens inside Write(), which holds g_dataLock and the
-// seqlock, so readers see the buff table, events and counters change
-// together. Writers: the game thread while probes are active; the worker
-// only between sessions.
+// This writer's layout of ABI 1.0. Readers find everything through the
+// directory, so capacities and the order of sections may change in a minor
+// version. Each section has its own seqlock; Write() opens only the ones a
+// change touches. Writers: the game thread while probes are active; the
+// worker only between sessions.
+constexpr uint32_t OPERATOR_SLOTS = 4, BUFF_SLOTS = 256, EVENT_SLOTS = 512;
+struct Layout {
+    EFB_Header header;
+    EFB_Section directory[4];
+    alignas(8) EFB_SectionHeader teamHead;
+    EFB_Team team;
+    alignas(8) EFB_SectionHeader opsHead;
+    EFB_Operator ops[OPERATOR_SLOTS];
+    alignas(8) EFB_BuffsHeader buffsHead;
+    EFB_Buff buffs[BUFF_SLOTS];
+    alignas(8) EFB_EventsHeader eventsHead;
+    EFB_Event events[EVENT_SLOTS];
+};
+static_assert(sizeof(Layout) <= EFB_MAPPING_SIZE, "layout fits the reserved mapping");
 HANDLE g_mapping = nullptr;
-EFB_Shared* g_view = nullptr;
+Layout* g_layout = nullptr;
 const wchar_t* g_mappingName = EFB_MAPPING_NAME; // tests use a private name
 SRWLOCK g_dataLock = SRWLOCK_INIT;
 int64_t g_qpcFreq = 1;
@@ -631,56 +646,101 @@ uint64_t ProcessStartTime() {
     FILETIME created{}, exited{}, kernel{}, user{};
     return GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user) ? FileTimeValue(created) : 0;
 }
-template<class Fn> void Write(Fn fn) {
+
+enum : unsigned { W_HEADER = 1, W_TEAM = 2, W_OPS = 4, W_BUFFS = 8, W_EVENTS = 16 };
+void OpenSeq(volatile uint32_t& seq) { seq |= 1; }
+void CloseSeq(volatile uint32_t& seq) { seq += 1; }
+// Runs fn under the data lock with the selected sections marked busy; with
+// none selected it only serializes private state. All selected sections are
+// busy before fn changes any of them, so a change spanning buffs and events
+// is seen by readers as a whole. The header closes last.
+template<class Fn> void Write(unsigned sections, Fn fn) {
+    Layout& l = *g_layout;
     AcquireSRWLockExclusive(&g_dataLock);
-    g_view->seq |= 1; // odd: writing
+    if (sections & W_HEADER) OpenSeq(l.header.seq);
+    if (sections & W_TEAM) OpenSeq(l.teamHead.seq);
+    if (sections & W_OPS) OpenSeq(l.opsHead.seq);
+    if (sections & W_BUFFS) OpenSeq(l.buffsHead.common.seq);
+    if (sections & W_EVENTS) OpenSeq(l.eventsHead.common.seq);
     MemoryBarrier();
     __try { fn(); }
     __finally {
-        g_view->published_at = QpcNow();
+        const int64_t now = QpcNow();
+        if (sections & W_TEAM) l.teamHead.updated_at = now;
+        if (sections & W_OPS) l.opsHead.updated_at = now;
+        if (sections & W_BUFFS) l.buffsHead.common.updated_at = now;
+        if (sections & W_EVENTS) l.eventsHead.common.updated_at = now;
         MemoryBarrier();
-        g_view->seq += 1;
+        if (sections & W_TEAM) CloseSeq(l.teamHead.seq);
+        if (sections & W_OPS) CloseSeq(l.opsHead.seq);
+        if (sections & W_BUFFS) CloseSeq(l.buffsHead.common.seq);
+        if (sections & W_EVENTS) CloseSeq(l.eventsHead.common.seq);
+        MemoryBarrier();
+        if (sections & W_HEADER) CloseSeq(l.header.seq);
         ReleaseSRWLockExclusive(&g_dataLock);
     }
 }
+template<class T> EFB_Section Describe(uint32_t id, const void* head, uint32_t headSize, const T* data,
+    uint32_t capacity) {
+    const char* base = reinterpret_cast<const char*>(g_layout);
+    return EFB_Section{id, headSize, uint32_t(static_cast<const char*>(head) - base),
+        uint32_t(reinterpret_cast<const char*>(data) - base), uint32_t(sizeof(T)), capacity};
+}
+// Builds the layout. The header seq is odd throughout, so no reader can
+// complete a read of the old content or of the half-built new one.
+void InitLayout(uint32_t session) {
+    Layout& l = *g_layout;
+    const uint32_t seq = l.header.seq | 1;
+    l.header.seq = seq;
+    MemoryBarrier();
+    memset(reinterpret_cast<char*>(&l) + sizeof(uint32_t), 0, EFB_MAPPING_SIZE - sizeof(uint32_t));
+    EFB_Header& h = l.header;
+    h.magic = EFB_MAGIC;
+    h.abi_major = EFB_ABI_MAJOR;
+    h.abi_minor = EFB_ABI_MINOR;
+    h.header_size = sizeof(EFB_Header);
+    h.total_size = sizeof(Layout);
+    h.directory_offset = uint32_t(offsetof(Layout, directory));
+    h.section_count = 4;
+    h.section_entry_size = sizeof(EFB_Section);
+    h.session = session;
+    h.writer_pid = GetCurrentProcessId();
+    h.writer_start_time = ProcessStartTime();
+    h.qpc_frequency = g_qpcFreq;
+    h.sample_interval_ms = 50;
+    l.directory[0] = Describe(EFB_SECTION_TEAM, &l.teamHead, sizeof(l.teamHead), &l.team, 1);
+    l.directory[1] = Describe(EFB_SECTION_OPERATORS, &l.opsHead, sizeof(l.opsHead), l.ops, OPERATOR_SLOTS);
+    l.directory[2] = Describe(EFB_SECTION_BUFFS, &l.buffsHead, sizeof(l.buffsHead), l.buffs, BUFF_SLOTS);
+    l.directory[3] = Describe(EFB_SECTION_EVENTS, &l.eventsHead, sizeof(l.eventsHead), l.events, EVENT_SLOTS);
+    MemoryBarrier();
+    l.header.seq = seq + 1;
+}
 bool OpenShared() {
-    if (g_view) return true;
+    if (g_layout) return true;
     LARGE_INTEGER f;
     QueryPerformanceFrequency(&f);
     g_qpcFreq = f.QuadPart;
-    g_mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(EFB_Shared),
-        g_mappingName);
+    g_mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, EFB_MAPPING_SIZE, g_mappingName);
     if (!g_mapping) { LogF("[SHM] CreateFileMapping failed: %lu", GetLastError()); return false; }
-    // Exists when a reader still holds the view of a game that has exited.
+    // Exists when a reader still holds the mapping of a game that has exited.
     const bool reused = GetLastError() == ERROR_ALREADY_EXISTS;
-    g_view = static_cast<EFB_Shared*>(MapViewOfFile(g_mapping, FILE_MAP_WRITE, 0, 0, sizeof(EFB_Shared)));
-    if (!g_view) {
+    g_layout = static_cast<Layout*>(MapViewOfFile(g_mapping, FILE_MAP_WRITE, 0, 0, EFB_MAPPING_SIZE));
+    if (!g_layout) {
         LogF("[SHM] MapViewOfFile failed: %lu", GetLastError());
         CloseHandle(g_mapping);
         g_mapping = nullptr;
         return false;
     }
-    // Keep session and event serials increasing for a reader that outlived the old writer.
-    const bool ours = reused && g_view->magic == EFB_MAGIC && g_view->layout_size == sizeof(EFB_Shared);
-    const uint32_t session = ours ? g_view->session : 0;
-    const uint64_t head = ours ? g_view->event_head : 0;
-    Write([&] {
-        memset(reinterpret_cast<char*>(g_view) + sizeof(g_view->seq), 0, sizeof(EFB_Shared) - sizeof(g_view->seq));
-        g_view->magic = EFB_MAGIC;
-        g_view->layout_version = EFB_LAYOUT_VERSION;
-        g_view->layout_size = sizeof(EFB_Shared);
-        g_view->session = session;
-        g_view->event_head = head;
-        g_view->writer_pid = GetCurrentProcessId();
-        g_view->writer_start_time = ProcessStartTime();
-        g_view->qpc_frequency = g_qpcFreq;
-    });
-    LogF("[SHM] %ls ready (%u bytes%s)", g_mappingName, unsigned(sizeof(EFB_Shared)), reused ? ", reused" : "");
+    // New content is a new session, also for a reader that outlived the old writer.
+    const EFB_Header& old = g_layout->header;
+    const bool ours = reused && old.magic == EFB_MAGIC && old.abi_major == EFB_ABI_MAJOR;
+    InitLayout(ours ? old.session + 1 : 0);
+    LogF("[SHM] %ls ready (%u bytes%s)", g_mappingName, unsigned(sizeof(Layout)), reused ? ", reused" : "");
     return true;
 }
 // Stop path: may run on any thread while the game thread is inside Write().
 void MarkWriterStopped() {
-    if (g_view) InterlockedExchange(reinterpret_cast<volatile LONG*>(&g_view->active), 0);
+    if (g_layout) InterlockedExchange(reinterpret_cast<volatile LONG*>(&g_layout->header.active), 0);
 }
 // Manager setting "sample_interval"; 0 samples every frame (tests only).
 std::atomic<int> g_sampleIntervalMs{50};
@@ -706,10 +766,7 @@ void ProbeAtb(void* node) {
     team.atb_max = At<float>(bm, off.bmAtbMax);
     team.atb_per_cell = setting && off.setPerCell >= 0 ? At<int32_t>(setting, off.setPerCell) : -1;
     team.sampled_at = now;
-    Write([&] {
-        g_view->team = team;
-        g_view->valid_mask |= EFB_VALID_TEAM;
-    });
+    Write(W_TEAM, [&] { g_layout->team = team; });
     const ULONGLONG tick = GetTickCount64();
     const bool changed = team.atb - g_lastAtb > 0.5f || g_lastAtb - team.atb > 0.5f || team.atb_max != g_lastAtbMax;
     if (!(changed && tick - g_lastAtbLog >= 200) && tick - g_lastAtbLog < 5000) return;
@@ -720,12 +777,12 @@ void ProbeAtb(void* node) {
 
 // ---- Squad slots via SquadIcon.LateTick: ultimate energy + combo CD ----
 struct SquadSlot { void* ability; uint32_t uid; };
-SquadSlot g_squad[EFB_MAX_OPERATORS]{};
-int64_t g_opSampledAt[EFB_MAX_OPERATORS]{};
+SquadSlot g_squad[OPERATOR_SLOTS]{};
+int64_t g_opSampledAt[OPERATOR_SLOTS]{};
 struct SlotLog { ULONGLONG at; float ult, cd; bool main; };
-SlotLog g_slotLog[EFB_MAX_OPERATORS]{};
+SlotLog g_slotLog[OPERATOR_SLOTS]{};
 int SquadIndexOf(void* ability) {
-    for (int i = 0; ability && i < EFB_MAX_OPERATORS; ++i)
+    for (int i = 0; ability && i < OPERATOR_SLOTS; ++i)
         if (g_squad[i].ability == ability) return i;
     return -1;
 }
@@ -745,7 +802,7 @@ void* FindSkill(void* ability, int type) {
 void ProbeSquad(void* icon) {
     NoteThread("SquadIcon.LateTick");
     const int index = At<int32_t>(icon, off.sqIndex);
-    if (index < 0 || index >= EFB_MAX_OPERATORS) return;
+    if (index < 0 || index >= OPERATOR_SLOTS) return;
     const int64_t now = QpcNow();
     if (!SampleDue(g_opSampledAt[index], now)) return;
     const ObjPtr ability = At<ObjPtr>(icon, off.sqAbility);
@@ -767,10 +824,7 @@ void ProbeSquad(void* icon) {
         if (combo && g_mCdRemaining) op.combo_cd_remaining = CallGetter<float>(g_mCdRemaining, combo);
         if (combo && g_mCooldown) op.combo_cooldown = CallGetter<float>(g_mCooldown, combo);
     }
-    Write([&] {
-        g_view->operators[index] = op;
-        g_view->valid_mask |= EFB_VALID_OPERATOR(index);
-    });
+    Write(W_OPS, [&] { g_layout->ops[index] = op; });
     SlotLog& last = g_slotLog[index];
     const ULONGLONG tick = GetTickCount64();
     const float ult = op.ultimate_sp, cd = op.combo_cd_remaining;
@@ -805,7 +859,7 @@ struct TrackedBuff {
     char parentClass[48];      // debug: non-buff parent root
     EFB_Buff info;             // what gets published
 };
-TrackedBuff g_tracked[EFB_MAX_BUFFS]{};
+TrackedBuff g_tracked[BUFF_SLOTS]{};
 uint32_t g_nextKey = 1;
 bool g_buffsDirty = false;     // a NEW or FINISHED entry waits for settlement
 int32_t g_settledFrame = INT32_MIN, g_tickedFrame = INT32_MIN;
@@ -920,40 +974,44 @@ const char* EventTag(int type) {
     default: return "-";
     }
 }
-// Inside Write().
+// Inside Write(W_EVENTS).
 void PushEvent(int type, const TrackedBuff& t, int64_t at, int32_t frame, int slot) {
-    const uint64_t serial = ++g_view->event_head;
-    EFB_Event& e = g_view->events[(serial - 1) % EFB_MAX_EVENTS];
+    const uint64_t serial = ++g_layout->eventsHead.head;
+    EFB_Event& e = g_layout->events[(serial - 1) % EVENT_SLOTS];
     e = EFB_Event{};
     e.serial = serial;
-    e.type = type;
-    e.finish_reason = type == EFB_EVENT_BUFF_FINISHED ? t.reason : 0;
-    e.key = t.info.key;
-    e.buff_slot = slot;
-    e.owner_uid = t.info.owner.instance_uid;
-    e.enhance_cnt = t.info.enhance_cnt;
+    e.type = uint32_t(type);
+    e.payload_size = sizeof(EFB_BuffEventPayload);
     e.frame = frame;
+    e.subject_uid = t.info.owner.instance_uid;
     e.at = at;
-    memcpy(e.buff_id, t.info.buff_id, sizeof(e.buff_id));
+    EFB_BuffEventPayload p{};
+    p.key = t.info.key;
+    p.buff_slot = slot;
+    p.finish_reason = type == EFB_EVENT_BUFF_FINISHED ? t.reason : 0;
+    p.enhance_cnt = t.info.enhance_cnt;
+    p.instance_uid = t.info.instance_uid;
+    memcpy(p.buff_id, t.info.buff_id, sizeof(p.buff_id));
+    memcpy(e.payload, &p, sizeof(p));
     LogBuff(EventTag(type), t, frame);
 }
-// Mirrors the private table into buffs[]. Inside Write().
+// Mirrors the private table into the buffs section. Inside Write(W_BUFFS).
 void MirrorBuffs() {
     uint32_t count = 0;
-    for (int i = 0; i < EFB_MAX_BUFFS; ++i) {
+    for (int i = 0; i < BUFF_SLOTS; ++i) {
         const TrackedBuff& t = g_tracked[i];
         // A pending finish stays visible until its frame settles, so a
         // finish+add refresh never blinks out of the table.
         if (t.state == TRACK_LIVE || (t.state == TRACK_FINISHED && t.info.key)) {
-            g_view->buffs[i] = t.info;
+            g_layout->buffs[i] = t.info;
             ++count;
-        } else if (g_view->buffs[i].key) {
-            g_view->buffs[i] = EFB_Buff{};
+        } else if (g_layout->buffs[i].key) {
+            g_layout->buffs[i] = EFB_Buff{};
         }
     }
-    g_view->buff_count = count;
+    g_layout->buffsHead.count = count;
 }
-// Settles every add/finish reported before `frame`. Inside Write().
+// Settles every add/finish reported before `frame`. Inside Write(W_BUFFS | W_EVENTS).
 void SettleBuffs(int32_t frame) {
     bool pending = false;
     for (auto& n : g_tracked) {
@@ -1022,7 +1080,7 @@ void UpdateDilation(TrackedBuff& t, int64_t now) {
     t.rateAt = now;
     t.ratePassed = t.info.passed_time;
 }
-// Re-read of every live buff, once per sample interval. Inside Write().
+// Re-read of every live buff, once per sample interval. Inside Write(W_BUFFS | W_EVENTS).
 void SampleBuffs(int32_t frame, int64_t now) {
     for (auto& t : g_tracked) {
         if (t.state != TRACK_LIVE) continue;
@@ -1056,16 +1114,21 @@ void ProbeBuff(const char* via, ObjPtr ref, bool applied, int32_t reason) {
     if (!buff || At<uint32_t>(buff, off.buffUid) != ref.uid) return; // stale head-bar replay
     const int32_t frame = FrameNow();
     const int64_t now = QpcNow();
-    Write([&] {
-        if (g_buffsDirty && frame > g_settledFrame) {
+    // Recording a change is private; sections open only when this call publishes.
+    const bool settle = g_buffsDirty && frame > g_settledFrame;
+    uint32_t flags = 0;
+    Write(settle ? W_BUFFS | W_EVENTS : 0u, [&] {
+        // Events may name buff slots, so the table follows every settlement.
+        if (settle) {
             SettleBuffs(frame);
             g_settledFrame = frame;
+            MirrorBuffs();
         }
         TrackedBuff* t = FindTracked(buff, ref.uid);
         if (!applied) {
             if (!t) {
                 // A finish for a buff never seen added: tracking began after it.
-                if (!IsRecentUid(ref.uid)) g_view->flags |= EFB_FLAG_BUFFS_PARTIAL;
+                if (!IsRecentUid(ref.uid)) flags |= EFB_BUFFS_PARTIAL;
                 return;
             }
             if (t->state == TRACK_FINISHED) return; // another panel already reported it
@@ -1080,8 +1143,7 @@ void ProbeBuff(const char* via, ObjPtr ref, bool applied, int32_t reason) {
         if (t) return; // the same buff reported by another panel
         for (auto& slot : g_tracked) if (slot.state == TRACK_FREE) { t = &slot; break; }
         if (!t) {
-            ++g_view->buffs_dropped;
-            g_view->flags |= EFB_FLAG_BUFFS_DROPPED;
+            flags |= EFB_BUFFS_DROPPED;
             RememberUid(ref.uid);
             if (ProbeLogAllowed()) LogF("[BUFF] table full, dropped uid=%u", ref.uid);
             return;
@@ -1093,6 +1155,10 @@ void ProbeBuff(const char* via, ObjPtr ref, bool applied, int32_t reason) {
         t->addAt = now;
         t->reason = EFB_FINISH_LOST;
         g_buffsDirty = true;
+    });
+    if (flags) Write(W_BUFFS, [&] {
+        g_layout->buffsHead.flags |= flags;
+        if (flags & EFB_BUFFS_DROPPED) ++g_layout->buffsHead.dropped;
     });
 }
 // HUD LateTick hooks (game thread): once per frame.
@@ -1107,13 +1173,15 @@ void Tick() {
     const bool settle = g_buffsDirty && frame > g_settledFrame;
     const bool sample = SampleDue(g_buffsSampledAt, now);
     if (!settle && !sample) return;
-    Write([&] {
+    const uint32_t interval = uint32_t(g_sampleIntervalMs.load());
+    const bool header = g_layout->header.sample_interval_ms != interval;
+    Write(W_BUFFS | W_EVENTS | (header ? W_HEADER : 0u), [&] {
+        if (header) g_layout->header.sample_interval_ms = interval;
         if (settle) {
             SettleBuffs(frame);
             g_settledFrame = frame;
         }
         if (sample) SampleBuffs(frame, now);
-        g_view->sample_interval_ms = uint32_t(g_sampleIntervalMs.load());
         MirrorBuffs();
     });
 }
@@ -1128,22 +1196,24 @@ void StartSession() {
     g_buffsDirty = false;
     g_settledFrame = g_tickedFrame = INT32_MIN;
     g_uiThread = 0;
-    Write([&] {
-        ++g_view->session;
-        g_view->session_started_at = QpcNow();
-        g_view->team = EFB_Team{};
-        memset(g_view->operators, 0, sizeof(g_view->operators));
-        memset(g_view->buffs, 0, sizeof(g_view->buffs));
-        g_view->buff_count = g_view->valid_mask = g_view->buffs_dropped = 0;
+    Write(W_HEADER | W_TEAM | W_OPS | W_BUFFS | W_EVENTS, [&] {
+        Layout& l = *g_layout;
+        ++l.header.session;
+        l.header.session_started_at = QpcNow();
+        l.header.sample_interval_ms = uint32_t(g_sampleIntervalMs.load());
+        l.team = EFB_Team{};
+        memset(l.ops, 0, sizeof(l.ops));
+        memset(l.buffs, 0, sizeof(l.buffs));
+        l.buffsHead.count = l.buffsHead.dropped = 0;
         // A re-enable starts in the middle of the game.
-        g_view->flags = g_sessionsStarted++ ? EFB_FLAG_BUFFS_PARTIAL : 0;
-        g_view->active = 1;
+        l.buffsHead.flags = g_sessionsStarted++ ? EFB_BUFFS_PARTIAL : 0;
+        l.header.active = 1;
     });
-    LogF("[SHM] session %u started", g_view->session);
+    LogF("[SHM] session %u started", g_layout->header.session);
 }
 // Restore: probes are drained, so no game-thread write is in flight.
 void EndSession() {
-    if (g_view) Write([] { g_view->active = 0; });
+    if (g_layout) Write(W_HEADER, [] { g_layout->header.active = 0; });
 }
 template<class Fn> void Guarded(Fn fn) {
     __try { fn(); }

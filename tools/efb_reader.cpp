@@ -5,15 +5,13 @@
 #include <windows.h>
 #include <algorithm>
 #include <cstdio>
-#include <cstring>
 #include <string>
 #include <vector>
 
 #include "../include/endfield_bridge_reader.h"
 
 namespace {
-const EFB_Shared* g_shared = nullptr;
-EFB_Shared g_state;
+efb::Mapping g_map;
 
 // "chr_0007_ikut_4616825702491504642" -> "chr_0007_ikut"
 std::string Short(const char* name) {
@@ -24,45 +22,74 @@ std::string Short(const char* name) {
         n.resize(cut);
     return n;
 }
-const char* EventName(int type) {
+const char* EventName(uint32_t type) {
     switch (type) {
     case EFB_EVENT_BUFF_ADDED: return "ADDED";
     case EFB_EVENT_BUFF_REFRESHED: return "REFRESHED";
     case EFB_EVENT_BUFF_ENHANCED: return "ENHANCED";
     case EFB_EVENT_BUFF_FINISHED: return "FINISHED";
-    default: return "?";
+    default: return nullptr;
     }
-}
-std::string Flags(const EFB_Shared& s) {
-    std::string f;
-    if (s.flags & EFB_FLAG_BUFFS_PARTIAL) f += " PARTIAL(buffs from before tracking may be missing)";
-    if (s.flags & EFB_FLAG_BUFFS_DROPPED) f += " DROPPED(" + std::to_string(s.buffs_dropped) + ")";
-    return f.empty() ? " -" : f;
 }
 
-void PrintState(const EFB_Shared& s) {
+// Everything the live view shows, read under one header seq.
+struct State {
+    efb::Header header;
+    EFB_Team team{};
+    std::vector<EFB_Operator> ops;
+    EFB_BuffsHeader buffsHead{};
+    std::vector<EFB_Buff> buffs;
+};
+bool Read(State& st) {
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        if (efb::ReadHeader(g_map, st.header) != efb::Result::Ok) { Sleep(1); continue; }
+        efb::Section team, ops, buffs;
+        if (efb::ReadSection(g_map, st.header, EFB_SECTION_TEAM, team) != efb::Result::Ok ||
+            efb::ReadSection(g_map, st.header, EFB_SECTION_OPERATORS, ops) != efb::Result::Ok ||
+            efb::ReadSection(g_map, st.header, EFB_SECTION_BUFFS, buffs) != efb::Result::Ok)
+            continue;
+        st.team = team.capacity() ? team.Element<EFB_Team>(0) : EFB_Team{};
+        st.ops.clear();
+        for (uint32_t i = 0; i < ops.capacity(); ++i) st.ops.push_back(ops.Element<EFB_Operator>(i));
+        st.buffsHead = buffs.Head<EFB_BuffsHeader>();
+        st.buffs.clear();
+        for (uint32_t i = 0; i < buffs.capacity(); ++i) {
+            const EFB_Buff b = buffs.Element<EFB_Buff>(i);
+            if (b.key) st.buffs.push_back(b);
+        }
+        return true;
+    }
+    return false;
+}
+
+void Print(const State& st) {
+    const EFB_Header& h = st.header.fields;
     const int64_t now = efb::Now();
-    const efb::Status status = efb::Check(s, now, efb::WriterAlive(s));
-    const bool online = status == efb::Status::Online;
-    std::printf("[%s] session=%u pid=%u published %.2fs ago  buffs=%u events=%llu  flags:%s\n\n",
-        efb::StatusName(status), s.session, s.writer_pid, efb::SecondsSince(s, s.published_at, now), s.buff_count,
-        (unsigned long long)s.event_head, Flags(s).c_str());
+    int64_t newest = st.team.sampled_at;
+    for (const auto& o : st.ops) newest = std::max(newest, o.sampled_at);
+    const efb::Status status = efb::Check(h, efb::WriterAlive(h), newest, now);
+    std::string flags;
+    if (st.buffsHead.flags & EFB_BUFFS_PARTIAL) flags += " PARTIAL";
+    if (st.buffsHead.flags & EFB_BUFFS_DROPPED) flags += " DROPPED(" + std::to_string(st.buffsHead.dropped) + ")";
+    std::printf("[%s] ABI %u.%u session=%u pid=%u interval=%ums buffs=%u flags:%s\n\n", efb::StatusName(status),
+        h.abi_major, h.abi_minor, h.session, h.writer_pid, h.sample_interval_ms, st.buffsHead.count,
+        flags.empty() ? " -" : flags.c_str());
     if (status == efb::Status::WriterGone || status == efb::Status::Disabled) return;
-    if (s.valid_mask & EFB_VALID_TEAM)
-        std::printf("SP %.1f / %.1f  (per cell %d)%s\n\n", s.team.atb, s.team.atb_max, s.team.atb_per_cell,
-            efb::TeamFresh(s, now) ? "" : "  [stale]");
+    if (st.team.sampled_at)
+        std::printf("SP %.1f / %.1f  (per cell %d)%s\n\n", st.team.atb, st.team.atb_max, st.team.atb_per_cell,
+            efb::Fresh(h, st.team.sampled_at, now) ? "" : "  [stale]");
     else
         std::printf("SP -\n\n");
-    for (int i = 0; i < EFB_MAX_OPERATORS; ++i) {
-        const EFB_Operator& o = s.operators[i];
-        if (!(s.valid_mask & EFB_VALID_OPERATOR(i))) { std::printf("[%d] (not sampled)\n", i); continue; }
-        if (!o.present) { std::printf("[%d] -\n", i); continue; }
-        std::printf("[%d]%s %-20s ult %6.1f/%-6.1f combo %5.1f/%-5.1f uid=%u%s\n", i,
+    for (size_t i = 0; i < st.ops.size(); ++i) {
+        const EFB_Operator& o = st.ops[i];
+        if (!o.sampled_at) { std::printf("[%zu] (not sampled)\n", i); continue; }
+        if (!o.present) { std::printf("[%zu] -\n", i); continue; }
+        std::printf("[%zu]%s %-20s ult %6.1f/%-6.1f combo %5.1f/%-5.1f uid=%u%s\n", i,
             o.is_main_character ? "*" : " ", Short(o.entity_name).c_str(), o.ultimate_sp, o.max_ultimate_sp,
-            o.combo_cd_remaining, o.combo_cooldown, o.instance_uid, efb::OperatorFresh(s, i, now) ? "" : "  [stale]");
+            o.combo_cd_remaining, o.combo_cooldown, o.instance_uid, efb::Fresh(h, o.sampled_at, now) ? "" : "  [stale]");
     }
     std::vector<const EFB_Buff*> buffs;
-    for (const auto& b : s.buffs) if (b.key) buffs.push_back(&b);
+    for (const auto& b : st.buffs) buffs.push_back(&b);
     std::sort(buffs.begin(), buffs.end(), [](const EFB_Buff* a, const EFB_Buff* b) {
         return a->owner.instance_uid != b->owner.instance_uid ? a->owner.instance_uid < b->owner.instance_uid
                                                               : a->key < b->key;
@@ -75,7 +102,7 @@ void PrintState(const EFB_Shared& s) {
         std::string from = Short(b->source.entity_name);
         if (b->root_source.instance_uid != b->source.instance_uid) from += " < " + Short(b->root_source.entity_name);
         char life[32];
-        const double left = efb::LifeLeft(s, *b, now, online);
+        const double left = efb::LifeLeft(h, *b, now, status == efb::Status::Online);
         if (left < 0) std::snprintf(life, sizeof(life), "inf");
         else std::snprintf(life, sizeof(life), "%.1f/%.1f", left, b->duration);
         std::printf("%-5u %-20.20s %-44.44s %-14s %4d %5.2f %3d %s\n", b->key, owner.c_str(), b->buff_id, life,
@@ -84,60 +111,59 @@ void PrintState(const EFB_Shared& s) {
 }
 
 int Events() {
-    uint64_t last = 0;
-    uint32_t session = 0;
+    efb::EventCursor cursor;
+    efb::Header header;
     bool wasAlive = true;
+    uint32_t session = 0;
     for (;;) {
         Sleep(50);
-        if (!efb::Snapshot(g_shared, g_state)) continue;
-        const bool alive = efb::WriterAlive(g_state);
+        if (efb::ReadHeader(g_map, header) != efb::Result::Ok) continue;
+        const bool alive = efb::WriterAlive(header.fields);
         if (alive != wasAlive) std::printf("--- writer %s ---\n", alive ? "back" : "gone");
         wasAlive = alive;
-        if (g_state.session != session) {
-            std::printf("--- session %u (re-read the buff table) ---\n", g_state.session);
-            session = g_state.session;
-            last = g_state.event_head;
+        efb::EventBatch batch;
+        if (cursor.Poll(g_map, header, batch) != efb::Result::Ok) continue;
+        if (batch.resync) {
+            if (header.fields.session != session) std::printf("--- session %u ---\n", header.fields.session);
+            if (batch.lost) std::printf("--- lost %llu events ---\n", (unsigned long long)batch.lost);
+            std::printf("--- re-read the buff table ---\n");
+            session = header.fields.session;
         }
-        if (g_state.event_head - last > EFB_MAX_EVENTS) {
-            std::printf("--- lost %llu events ---\n", (unsigned long long)(g_state.event_head - last - EFB_MAX_EVENTS));
-            last = g_state.event_head - EFB_MAX_EVENTS;
-        }
-        for (uint64_t n = last + 1; n <= g_state.event_head; ++n) {
-            const EFB_Event& e = g_state.events[(n - 1) % EFB_MAX_EVENTS];
-            std::printf("#%-6llu f=%-7d %-9s key=%-5u %-44s stacks=%d", (unsigned long long)e.serial, e.frame,
-                EventName(e.type), e.key, e.buff_id, e.enhance_cnt);
-            if (e.type == EFB_EVENT_BUFF_FINISHED) std::printf(" reason=%d", e.finish_reason);
-            if (e.buff_slot < 0) std::printf(" (same-frame)");
+        for (const EFB_Event& e : batch.events) {
+            const char* name = EventName(e.type);
+            if (!name) continue; // a type from a newer writer
+            const auto p = efb::Payload<EFB_BuffEventPayload>(e);
+            std::printf("#%-6llu f=%-7d %-9s key=%-5u %-44s stacks=%d", (unsigned long long)e.serial, e.frame, name,
+                p.key, p.buff_id, p.enhance_cnt);
+            if (e.type == EFB_EVENT_BUFF_FINISHED) std::printf(" reason=%d", p.finish_reason);
+            if (p.buff_slot < 0) std::printf(" (same-frame)");
             std::printf("\n");
         }
-        last = g_state.event_head;
     }
 }
 } // namespace
 
 int main(int argc, char** argv) {
     SetConsoleOutputCP(CP_UTF8);
-    HANDLE h = OpenFileMappingW(FILE_MAP_READ, FALSE, EFB_MAPPING_NAME);
-    if (!h) { std::printf("%ls not found (game not running or plugin inactive)\n", EFB_MAPPING_NAME); return 1; }
-    g_shared = static_cast<const EFB_Shared*>(MapViewOfFile(h, FILE_MAP_READ, 0, 0, sizeof(EFB_Shared)));
-    if (!g_shared) { std::printf("MapViewOfFile failed: %lu\n", GetLastError()); return 1; }
-    if (!efb::Snapshot(g_shared, g_state) || !efb::LayoutMatches(g_state)) {
-        std::printf("layout mismatch (version %u, size %u)\n", g_state.layout_version, g_state.layout_size);
-        return 1;
-    }
+    if (!g_map.Open()) { std::printf("%ls not found (game not running or plugin inactive)\n", EFB_MAPPING_NAME); return 1; }
+    efb::Header header;
+    const efb::Result r = efb::ReadHeader(g_map, header);
+    if (r == efb::Result::Incompatible) { std::printf("not an EndfieldDataBridge ABI %u mapping\n", EFB_ABI_MAJOR); return 1; }
     const std::string mode = argc > 1 ? argv[1] : "";
     if (mode == "--events") return Events();
+    State st;
     if (mode == "--once") {
-        PrintState(g_state);
+        if (!Read(st)) return 1;
+        Print(st);
         return 0;
     }
     DWORD console = 0;
     HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
     if (GetConsoleMode(out, &console)) SetConsoleMode(out, console | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
     for (;;) {
-        if (efb::Snapshot(g_shared, g_state)) {
+        if (Read(st)) {
             std::printf("\x1b[H\x1b[2J");
-            PrintState(g_state);
+            Print(st);
         }
         Sleep(250);
     }

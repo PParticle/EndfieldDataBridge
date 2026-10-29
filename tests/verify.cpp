@@ -11,6 +11,7 @@
 #define CHECK(expression) do { \
     if (!(expression)) { \
         std::printf("[FAIL] %s:%d: %s\n", __FILE__, __LINE__, #expression); \
+        std::fflush(stdout); /* ExitProcess skips stdio flushing */ \
         ExitProcess(1); \
     } \
 } while (false)

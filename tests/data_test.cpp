@@ -1,12 +1,17 @@
-// Offline data-path tests: the plugin source is compiled into this exe so the
+// Offline data-path tests. The plugin source is compiled into this exe so the
 // tracker runs against fake Buff / AbilitySystem objects laid out at known
-// offsets, with a fake frame counter and clock. No IL2CPP or game needed.
+// offsets, with a fake frame counter and clock. Every result is checked
+// through the reference reader (include/endfield_bridge_reader.h), the same
+// code a consumer uses. No IL2CPP or game needed.
 #include "../src/plugin.cpp"
 #include "../include/endfield_bridge_reader.h"
+
+#include <algorithm>
 
 #define CHECK(expression) do { \
     if (!(expression)) { \
         std::printf("[FAIL] %s:%d: %s\n", __FILE__, __LINE__, #expression); \
+        std::fflush(stdout); /* ExitProcess skips stdio flushing */ \
         ExitProcess(1); \
     } \
 } while (false)
@@ -18,6 +23,7 @@ int32_t Frame() { return g_frame; }
 int64_t Clock() { return g_now; }
 void Advance(double seconds) { g_now += int64_t(seconds * double(g_qpcFreq)); }
 
+// ---- Fake game objects ----
 // Managed System.String: length at +0x10, UTF-16 chars at +0x14.
 struct FakeString { alignas(8) char bytes[0x14 + 2 * 64]{}; };
 void SetString(FakeString& s, const char* text) {
@@ -28,7 +34,7 @@ void SetString(FakeString& s, const char* text) {
 }
 struct FakeAbility { alignas(8) char bytes[0x40]{}; };
 struct FakeBuff { alignas(8) char bytes[0x80]{}; FakeString id; };
-template<class T> void Put(void* obj, int offset, T value) { memcpy(static_cast<char*>(obj) + offset, &value, sizeof(T)); }
+template<class T> void Put(void* obj, size_t offset, T value) { memcpy(static_cast<char*>(obj) + offset, &value, sizeof(T)); }
 
 void SetUpOffsets() {
     off = Offsets{};
@@ -57,47 +63,83 @@ void Report(FakeBuff& b, bool applied, int32_t reason = EFB_FINISH_OTHER) {
 }
 void NextFrame() { ++g_frame; Advance(1.0 / 60); Tick(); }
 
-uint64_t g_seen = 0;
-std::vector<EFB_Event> NewEvents() {
-    std::vector<EFB_Event> out;
-    for (uint64_t n = g_seen + 1; n <= g_view->event_head; ++n) out.push_back(g_view->events[(n - 1) % EFB_MAX_EVENTS]);
-    g_seen = g_view->event_head;
-    return out;
+// ---- Consumer side: everything below reads through efb:: only ----
+efb::Mapping g_reader;
+efb::EventCursor g_cursor;
+struct View {
+    efb::Header header;
+    EFB_BuffsHeader buffsHead{};
+    std::vector<EFB_Buff> buffs; // live entries
+    EFB_Team team{};
+    const EFB_Buff* Find(uint32_t key) const {
+        for (const auto& b : buffs) if (b.key == key) return &b;
+        return nullptr;
+    }
+};
+View Read() {
+    View v;
+    for (;;) {
+        CHECK(efb::ReadHeader(g_reader, v.header) == efb::Result::Ok);
+        efb::Section buffs, team;
+        const efb::Result rb = efb::ReadSection(g_reader, v.header, EFB_SECTION_BUFFS, buffs);
+        const efb::Result rt = rb == efb::Result::Ok ? efb::ReadSection(g_reader, v.header, EFB_SECTION_TEAM, team) : rb;
+        if (rt == efb::Result::Retry) continue;
+        CHECK(rt == efb::Result::Ok);
+        v.buffsHead = buffs.Head<EFB_BuffsHeader>();
+        v.buffs.clear();
+        for (uint32_t i = 0; i < buffs.capacity(); ++i) {
+            const EFB_Buff b = buffs.Element<EFB_Buff>(i);
+            if (b.key) v.buffs.push_back(b);
+        }
+        v.team = team.Element<EFB_Team>(0);
+        return v;
+    }
 }
-const EFB_Buff* FindKey(uint32_t key) {
-    for (const auto& b : g_view->buffs) if (b.key == key) return &b;
-    return nullptr;
+struct Ev { uint32_t type; int32_t frame; EFB_BuffEventPayload p; };
+std::vector<Ev> NewEvents(efb::EventBatch* batchOut = nullptr) {
+    efb::Header h;
+    CHECK(efb::ReadHeader(g_reader, h) == efb::Result::Ok);
+    efb::EventBatch batch;
+    CHECK(g_cursor.Poll(g_reader, h, batch) == efb::Result::Ok);
+    std::vector<Ev> out;
+    for (const auto& e : batch.events) out.push_back({e.type, e.frame, efb::Payload<EFB_BuffEventPayload>(e)});
+    if (batchOut) *batchOut = batch;
+    return out;
 }
 // Each test starts like a first enable.
 void Reset() {
     g_sessionsStarted = 0;
     StartSession();
-    g_seen = g_view->event_head;
+    efb::EventBatch batch;
+    NewEvents(&batch);
+    CHECK(batch.resync && batch.events.empty());
 }
 void TestAddRefreshFinish() {
     Reset();
     FakeAbility ikut{}, enemy{};
     MakeAbility(ikut, 11); MakeAbility(enemy, 22);
-    FakeBuff a{}, a2{}, a3{};
+    FakeBuff a{}, a2{}, a3{}, b{};
     MakeBuff(a, "buff_wpn_sword_0012_atk_up", 100, ikut, 11, ikut, 11, 20);
     Report(a, true);
     CHECK(NewEvents().empty()); // settled on the next frame
     NextFrame();
     auto ev = NewEvents();
-    CHECK(ev.size() == 1 && ev[0].type == EFB_EVENT_BUFF_ADDED && ev[0].buff_slot >= 0 && ev[0].frame == g_frame - 1);
-    const uint32_t key = ev[0].key;
-    CHECK(key && FindKey(key) && FindKey(key)->instance_uid == 100 && g_view->buff_count == 1);
-    CHECK(!strcmp(FindKey(key)->buff_id, "buff_wpn_sword_0012_atk_up"));
+    CHECK(ev.size() == 1 && ev[0].type == EFB_EVENT_BUFF_ADDED && ev[0].p.buff_slot >= 0 && ev[0].frame == g_frame - 1);
+    const uint32_t key = ev[0].p.key;
+    View v = Read();
+    CHECK(key && v.Find(key) && v.Find(key)->instance_uid == 100 && v.buffsHead.count == 1);
+    CHECK(!strcmp(v.Find(key)->buff_id, "buff_wpn_sword_0012_atk_up") && !strcmp(ev[0].p.buff_id, v.Find(key)->buff_id));
 
     // Refresh as finish(old) + add(new) in one frame keeps the key.
     MakeBuff(a2, "buff_wpn_sword_0012_atk_up", 101, ikut, 11, ikut, 11, 20);
     Report(a, false);
     Report(a2, true);
-    CHECK(FindKey(key)); // still visible while the frame settles
+    CHECK(Read().Find(key)); // still visible while the frame settles
     NextFrame();
     ev = NewEvents();
-    CHECK(ev.size() == 1 && ev[0].type == EFB_EVENT_BUFF_REFRESHED && ev[0].key == key);
-    CHECK(FindKey(key)->instance_uid == 101 && g_view->buff_count == 1);
+    CHECK(ev.size() == 1 && ev[0].type == EFB_EVENT_BUFF_REFRESHED && ev[0].p.key == key && ev[0].p.instance_uid == 101);
+    v = Read();
+    CHECK(v.Find(key)->instance_uid == 101 && v.buffsHead.count == 1);
 
     // Same, in the other order.
     MakeBuff(a3, "buff_wpn_sword_0012_atk_up", 102, ikut, 11, ikut, 11, 20);
@@ -105,16 +147,15 @@ void TestAddRefreshFinish() {
     Report(a2, false);
     NextFrame();
     ev = NewEvents();
-    CHECK(ev.size() == 1 && ev[0].type == EFB_EVENT_BUFF_REFRESHED && ev[0].key == key);
+    CHECK(ev.size() == 1 && ev[0].type == EFB_EVENT_BUFF_REFRESHED && ev[0].p.key == key);
 
     // A different source is a different buff, not a refresh.
-    FakeBuff b{};
     MakeBuff(b, "buff_wpn_sword_0012_atk_up", 200, ikut, 11, enemy, 22, 20);
     Report(b, true);
     NextFrame();
     ev = NewEvents();
-    CHECK(ev.size() == 1 && ev[0].type == EFB_EVENT_BUFF_ADDED && ev[0].key != key);
-    const uint32_t keyB = ev[0].key;
+    CHECK(ev.size() == 1 && ev[0].type == EFB_EVENT_BUFF_ADDED && ev[0].p.key != key);
+    const uint32_t keyB = ev[0].p.key;
 
     // Duplicate reports from a second panel produce nothing.
     Report(b, true);
@@ -128,7 +169,7 @@ void TestAddRefreshFinish() {
     Put<float>(a3.bytes, off.buffPassed, 0.0f);
     NextFrame();
     ev = NewEvents();
-    CHECK(ev.size() == 1 && ev[0].type == EFB_EVENT_BUFF_REFRESHED && ev[0].key == key);
+    CHECK(ev.size() == 1 && ev[0].type == EFB_EVENT_BUFF_REFRESHED && ev[0].p.key == key);
 
     // Every stack change is an event.
     Put<int32_t>(a3.bytes, off.buffEnhance, 2);
@@ -136,8 +177,8 @@ void TestAddRefreshFinish() {
     Put<int32_t>(a3.bytes, off.buffEnhance, 3);
     NextFrame();
     ev = NewEvents();
-    CHECK(ev.size() == 2 && ev[0].type == EFB_EVENT_BUFF_ENHANCED && ev[0].enhance_cnt == 2 &&
-        ev[1].enhance_cnt == 3 && FindKey(key)->enhance_cnt == 3);
+    CHECK(ev.size() == 2 && ev[0].type == EFB_EVENT_BUFF_ENHANCED && ev[0].p.enhance_cnt == 2 &&
+        ev[1].p.enhance_cnt == 3 && Read().Find(key)->enhance_cnt == 3);
 
     // Finish: reported reason, at the frame the game reported it.
     const int32_t finishFrame = g_frame;
@@ -145,29 +186,30 @@ void TestAddRefreshFinish() {
     Report(a3, false, EFB_FINISH_LIFETIME); // second panel
     NextFrame();
     ev = NewEvents();
-    CHECK(ev.size() == 1 && ev[0].type == EFB_EVENT_BUFF_FINISHED && ev[0].key == key &&
-        ev[0].finish_reason == EFB_FINISH_LIFETIME && ev[0].frame == finishFrame);
-    CHECK(!FindKey(key) && FindKey(keyB) && g_view->buff_count == 1);
+    CHECK(ev.size() == 1 && ev[0].type == EFB_EVENT_BUFF_FINISHED && ev[0].p.key == key &&
+        ev[0].p.finish_reason == EFB_FINISH_LIFETIME && ev[0].frame == finishFrame);
+    v = Read();
+    CHECK(!v.Find(key) && v.Find(keyB) && v.buffsHead.count == 1);
     // A late duplicate after settlement does not mark the table partial.
     Report(a3, false);
     NextFrame();
-    CHECK(!(g_view->flags & EFB_FLAG_BUFFS_PARTIAL) && NewEvents().empty());
+    CHECK(!(Read().buffsHead.flags & EFB_BUFFS_PARTIAL) && NewEvents().empty());
     std::puts("[OK] Add, finish+add refresh (both orders), in-place refresh, stacks, finish, duplicates");
 }
 
 void TestSameFrameAndLost() {
     Reset();
-    FakeAbility ikut{};
-    MakeAbility(ikut, 11);
-    FakeBuff flash{}, reused{}, orphan{};
+    FakeAbility ikut{}, enemy{};
+    MakeAbility(ikut, 11); MakeAbility(enemy, 22);
+    FakeBuff flash{}, reused{}, orphan{}, unknown{};
     MakeBuff(flash, "buff_common_fire_fire_burning_triggered", 300, ikut, 11, ikut, 11, 0);
     Report(flash, true);
     Report(flash, false, EFB_FINISH_EARLY);
     NextFrame();
     auto ev = NewEvents();
     CHECK(ev.size() == 2 && ev[0].type == EFB_EVENT_BUFF_ADDED && ev[1].type == EFB_EVENT_BUFF_FINISHED &&
-        ev[0].key == ev[1].key && ev[0].buff_slot == -1 && ev[1].finish_reason == EFB_FINISH_EARLY);
-    CHECK(g_view->buff_count == 0);
+        ev[0].p.key == ev[1].p.key && ev[0].p.buff_slot == -1 && ev[1].p.finish_reason == EFB_FINISH_EARLY);
+    CHECK(Read().buffsHead.count == 0);
 
     // The game reused the object for another buff: finished as LOST.
     MakeBuff(reused, "buff_a", 310, ikut, 11, ikut, 11, 10);
@@ -178,11 +220,9 @@ void TestSameFrameAndLost() {
     NextFrame();
     NextFrame();
     ev = NewEvents();
-    CHECK(ev.size() == 1 && ev[0].type == EFB_EVENT_BUFF_FINISHED && ev[0].finish_reason == EFB_FINISH_LOST);
+    CHECK(ev.size() == 1 && ev[0].type == EFB_EVENT_BUFF_FINISHED && ev[0].p.finish_reason == EFB_FINISH_LOST);
 
     // The owner despawned.
-    FakeAbility enemy{};
-    MakeAbility(enemy, 22);
     MakeBuff(orphan, "buff_b", 320, enemy, 22, ikut, 11, 10);
     Report(orphan, true);
     NextFrame();
@@ -191,14 +231,13 @@ void TestSameFrameAndLost() {
     NextFrame();
     NextFrame();
     ev = NewEvents();
-    CHECK(ev.size() == 1 && ev[0].type == EFB_EVENT_BUFF_FINISHED && ev[0].finish_reason == EFB_FINISH_LOST);
+    CHECK(ev.size() == 1 && ev[0].type == EFB_EVENT_BUFF_FINISHED && ev[0].p.finish_reason == EFB_FINISH_LOST);
 
     // A finish for a buff never seen added: tracking started late.
-    FakeBuff unknown{};
     MakeBuff(unknown, "buff_c", 330, ikut, 11, ikut, 11, 10);
     Report(unknown, false);
     NextFrame();
-    CHECK((g_view->flags & EFB_FLAG_BUFFS_PARTIAL) && NewEvents().empty());
+    CHECK((Read().buffsHead.flags & EFB_BUFFS_PARTIAL) && NewEvents().empty());
     std::puts("[OK] Same-frame add+finish, reused object, despawned owner, late-start detection");
 }
 
@@ -210,16 +249,16 @@ void TestDilation() {
     MakeBuff(b, "buff_d", 400, ikut, 11, ikut, 11, 30);
     Report(b, true);
     NextFrame();
-    const uint32_t key = NewEvents()[0].key;
+    const uint32_t key = NewEvents()[0].p.key;
     float passed = 0;
     for (int i = 0; i < 30; ++i) { passed += 0.5f / 60; Put<float>(b.bytes, off.buffPassed, passed); NextFrame(); }
-    const float slow = FindKey(key)->time_dilation;
+    const float slow = Read().Find(key)->time_dilation;
     CHECK(slow > 0.4f && slow < 0.6f);
     for (int i = 0; i < 30; ++i) NextFrame();
-    CHECK(FindKey(key)->time_dilation == 0);
+    CHECK(Read().Find(key)->time_dilation == 0);
     for (int i = 0; i < 30; ++i) { passed += 1.0f / 60; Put<float>(b.bytes, off.buffPassed, passed); NextFrame(); }
-    CHECK(FindKey(key)->time_dilation == 1);
-    CHECK(FindKey(key)->sampled_at == g_now);
+    const View v = Read();
+    CHECK(v.Find(key)->time_dilation == 1 && v.Find(key)->sampled_at == g_now);
     CHECK(NewEvents().empty()); // timers moving is not an event
     std::puts("[OK] Time dilation follows game time (0.5x, frozen, 1x) without events");
 }
@@ -228,61 +267,50 @@ void TestOverflow() {
     Reset();
     FakeAbility ikut{};
     MakeAbility(ikut, 11);
-    static FakeBuff many[EFB_MAX_BUFFS + 3];
-    for (int i = 0; i < EFB_MAX_BUFFS + 3; ++i) {
+    static FakeBuff many[BUFF_SLOTS + 3];
+    for (uint32_t i = 0; i < BUFF_SLOTS + 3; ++i) {
         MakeBuff(many[i], "buff_many", 1000 + i, ikut, 11, ikut, 11, 10);
         Report(many[i], true);
     }
     NextFrame();
-    CHECK(g_view->buff_count == EFB_MAX_BUFFS && g_view->buffs_dropped == 3 &&
-        (g_view->flags & EFB_FLAG_BUFFS_DROPPED));
+    View v = Read();
+    CHECK(v.buffsHead.count == BUFF_SLOTS && v.buffsHead.dropped == 3 && (v.buffsHead.flags & EFB_BUFFS_DROPPED));
     // A finish for a dropped buff is not a missed add.
-    Report(many[EFB_MAX_BUFFS + 1], false);
+    Report(many[BUFF_SLOTS + 1], false);
     NextFrame();
-    CHECK(!(g_view->flags & EFB_FLAG_BUFFS_PARTIAL));
-    // More events than the ring holds: the reader can detect the gap.
-    for (int i = 0; i < EFB_MAX_BUFFS; ++i) Report(many[i], false);
+    CHECK(!(Read().buffsHead.flags & EFB_BUFFS_PARTIAL));
+    // More events than the ring holds: the cursor reports the loss and asks for a resync.
+    for (uint32_t i = 0; i < BUFF_SLOTS; ++i) Report(many[i], false);
     NextFrame();
-    Report(many[EFB_MAX_BUFFS], true);
+    Report(many[BUFF_SLOTS], true);
     NextFrame();
-    CHECK(g_view->buff_count == 1 && g_view->event_head - g_seen > EFB_MAX_EVENTS);
-    std::puts("[OK] Table overflow counted and flagged; event ring overrun detectable");
+    efb::EventBatch batch;
+    NewEvents(&batch);
+    CHECK(batch.resync && batch.lost == 2 * BUFF_SLOTS + 1 - EVENT_SLOTS && batch.events.size() == EVENT_SLOTS);
+    CHECK(Read().buffsHead.count == 1);
+    std::puts("[OK] Table overflow counted and flagged; event ring overrun reported to the cursor");
 }
-
 void TestSessionAndLiveness() {
     Reset();
-    const uint32_t session = g_view->session;
-    CHECK(g_view->active && !(g_view->flags & EFB_FLAG_BUFFS_PARTIAL)); // first enable of the process
-    StartSession();
-    CHECK(g_view->session == session + 1 && (g_view->flags & EFB_FLAG_BUFFS_PARTIAL)); // re-enable mid-game
-    EFB_Shared copy{};
-    CHECK(efb::Snapshot(g_view, copy) && efb::LayoutMatches(copy));
-    CHECK(efb::WriterAlive(copy));
-    copy.writer_start_time += 1; // same pid, different process
-    CHECK(!efb::WriterAlive(copy));
-    CHECK(efb::Snapshot(g_view, copy));
-    CHECK(!efb::TeamFresh(copy, efb::Now()) && efb::Check(copy, efb::Now(), true) == efb::Status::Stale);
+    View v = Read();
+    const uint32_t session = v.header.fields.session;
+    CHECK(v.header.fields.active && !(v.buffsHead.flags & EFB_BUFFS_PARTIAL)); // first enable of the process
+    StartSession(); // re-enable mid-game
+    efb::EventBatch batch;
+    NewEvents(&batch);
+    v = Read();
+    CHECK(batch.resync && v.header.fields.session == session + 1 && (v.buffsHead.flags & EFB_BUFFS_PARTIAL));
+    CHECK(efb::WriterAlive(v.header.fields));
+    EFB_Header other = v.header.fields;
+    other.writer_start_time += 1; // same pid, different process
+    CHECK(!efb::WriterAlive(other));
+    CHECK(!v.team.sampled_at && efb::Check(v.header.fields, true, v.team.sampled_at, g_now) == efb::Status::Stale);
+    CHECK(efb::Check(v.header.fields, true, g_now, g_now) == efb::Status::Online);
     EndSession();
-    CHECK(efb::Snapshot(g_view, copy) && efb::Check(copy, efb::Now(), true) == efb::Status::Disabled);
+    CHECK(efb::Check(Read().header.fields, true, g_now, g_now) == efb::Status::Disabled);
     std::puts("[OK] Session restart, partial flag on re-enable, writer identity, freshness, disabled");
 }
 
-// A reader thread must never see a torn snapshot while the game thread writes.
-volatile LONG g_stopReader = 0;
-DWORD WINAPI TornReader(void* arg) {
-    auto* failures = static_cast<volatile LONG*>(arg);
-    static EFB_Shared copy;
-    while (!g_stopReader) {
-        if (!efb::Snapshot(g_view, copy)) continue;
-        // Writer invariant: every live entry carries enhance_cnt == buff_count.
-        for (const auto& b : copy.buffs)
-            if (b.key && uint32_t(b.enhance_cnt) != copy.buff_count) InterlockedIncrement(failures);
-        uint32_t n = 0;
-        for (const auto& b : copy.buffs) n += b.key != 0;
-        if (n != copy.buff_count) InterlockedIncrement(failures);
-    }
-    return 0;
-}
 // Timers follow the configured interval; adds and finishes still settle every frame.
 void TestSampleInterval() {
     Reset();
@@ -296,16 +324,16 @@ void TestSampleInterval() {
     NextFrame();
     auto ev = NewEvents();
     CHECK(ev.size() == 1 && ev[0].type == EFB_EVENT_BUFF_ADDED); // not delayed by the interval
-    const uint32_t key = ev[0].key;
-    const int64_t first = FindKey(key)->sampled_at;
+    const uint32_t key = ev[0].p.key;
+    const int64_t first = Read().Find(key)->sampled_at;
     Put<int32_t>(b.bytes, off.buffEnhance, 2);
     int frames = 0;
-    while (FindKey(key)->sampled_at == first) { NextFrame(); ++frames; CHECK(frames < 20); }
+    while (Read().Find(key)->sampled_at == first) { NextFrame(); ++frames; CHECK(frames < 20); }
     // 100 ms at 60 fps: the next read lands on the 5th-7th frame.
-    CHECK(frames >= 5 && frames <= 7 && FindKey(key)->enhance_cnt == 2);
+    const View v = Read();
+    CHECK(frames >= 5 && frames <= 7 && v.Find(key)->enhance_cnt == 2 && v.header.fields.sample_interval_ms == 100);
     ev = NewEvents();
     CHECK(ev.size() == 1 && ev[0].type == EFB_EVENT_BUFF_ENHANCED);
-    CHECK(g_view->sample_interval_ms == 100);
     Report(b, false, EFB_FINISH_EARLY);
     NextFrame();
     ev = NewEvents();
@@ -314,37 +342,236 @@ void TestSampleInterval() {
     std::puts("[OK] Sample interval paces timer reads; adds and finishes stay per-frame");
 }
 
-void TestSeqlock() {
+void TestSectionIndependence() {
+    Reset();
+    efb::Header h;
+    efb::Section s;
+    CHECK(efb::ReadHeader(g_reader, h) == efb::Result::Ok);
+    // The writer holding one section busy does not block the others.
+    AcquireSRWLockExclusive(&g_dataLock);
+    g_layout->teamHead.seq |= 1;
+    CHECK(efb::ReadSection(g_reader, h, EFB_SECTION_TEAM, s) == efb::Result::Busy);
+    CHECK(efb::ReadSection(g_reader, h, EFB_SECTION_BUFFS, s) == efb::Result::Ok);
+    CHECK(efb::ReadSection(g_reader, h, EFB_SECTION_EVENTS, s) == efb::Result::Ok);
+    g_layout->teamHead.seq += 1;
+    ReleaseSRWLockExclusive(&g_dataLock);
+    CHECK(efb::ReadSection(g_reader, h, EFB_SECTION_TEAM, s) == efb::Result::Ok);
+    // A section read under a header that changed meanwhile must be redone.
+    Write(W_HEADER, [] {});
+    CHECK(efb::ReadSection(g_reader, h, EFB_SECTION_TEAM, s) == efb::Result::Retry);
+    CHECK(efb::ReadHeader(g_reader, h) == efb::Result::Ok && efb::ReadSection(g_reader, h, EFB_SECTION_TEAM, s) == efb::Result::Ok);
+    // Settling a buff publishes its event and the table change in one write
+    // per section (seq + 2), so no reader can see the event without the buff.
+    FakeAbility ikut{};
+    MakeAbility(ikut, 11);
+    FakeBuff b{};
+    MakeBuff(b, "buff_f", 600, ikut, 11, ikut, 11, 10);
+    Report(b, true);
+    uint32_t buffsSeq = g_layout->buffsHead.common.seq, eventsSeq = g_layout->eventsHead.common.seq;
+    NextFrame();
+    CHECK(g_layout->buffsHead.common.seq == buffsSeq + 2 && g_layout->eventsHead.common.seq == eventsSeq + 2);
+    // The same when the next UI callback settles it before the HUD ticks.
+    FakeBuff c{}, d{};
+    MakeBuff(c, "buff_g", 601, ikut, 11, ikut, 11, 10);
+    MakeBuff(d, "buff_h", 602, ikut, 11, ikut, 11, 10);
+    Report(c, true);
+    ++g_frame;
+    buffsSeq = g_layout->buffsHead.common.seq;
+    eventsSeq = g_layout->eventsHead.common.seq;
+    Report(d, true);
+    CHECK(g_layout->buffsHead.common.seq == buffsSeq + 2 && g_layout->eventsHead.common.seq == eventsSeq + 2);
+    CHECK(Read().buffsHead.count == 2);
+    std::puts("[OK] Per-section seqlocks: one busy section does not block others; header change forces a re-read;"
+        " events and the buff table publish together");
+}
+
+// A hand-built mapping from a hypothetical newer minor version (bigger
+// header, directory entries, section headers and elements, an unknown
+// section, an unknown event type, an unknown flag) and an older one
+// (smaller operator element). The 1.0 reader must read what it knows.
+void TestCompatibility() {
+    alignas(8) static char buf[8192];
+    memset(buf, 0, sizeof(buf));
+    EFB_Header h{};
+    h.magic = EFB_MAGIC;
+    h.abi_major = EFB_ABI_MAJOR;
+    h.abi_minor = EFB_ABI_MINOR + 1;
+    h.header_size = sizeof(EFB_Header) + 8;
+    h.total_size = sizeof(buf);
+    h.directory_offset = 128;
+    h.section_count = 5;
+    h.section_entry_size = sizeof(EFB_Section) + 8;
+    h.session = 7;
+    h.active = 1;
+    h.qpc_frequency = g_qpcFreq;
+    Put(buf, 0, h);
+    Put<uint64_t>(buf, sizeof(EFB_Header), 0x1111111111111111ull); // a header field from the future
+    const EFB_Section sections[] = {
+        {99, 16, 256, 272, 8, 4},                                                       // unknown section
+        {EFB_SECTION_OPERATORS, 16, 320, 336, uint32_t(offsetof(EFB_Operator, sampled_at)), 2}, // older: no sampled_at
+        {EFB_SECTION_BUFFS, sizeof(EFB_BuffsHeader) + 8, 512, 552, sizeof(EFB_Buff) + 16, 3},
+        {EFB_SECTION_EVENTS, sizeof(EFB_EventsHeader) + 8, 4096, 4128, sizeof(EFB_Event) + 64, 4},
+        {EFB_SECTION_TEAM, 16, 8000, 8016, sizeof(EFB_Team), 8},                        // runs past total_size
+    };
+    for (uint32_t i = 0; i < 5; ++i) {
+        Put(buf, 128 + i * h.section_entry_size, sections[i]);
+        Put<uint64_t>(buf, 128 + i * h.section_entry_size + sizeof(EFB_Section), ~0ull);
+    }
+    EFB_Operator op{};
+    op.present = 1;
+    op.ultimate_sp = 42;
+    Put(buf, 336 + 88, op); // element 1 of the older operator section (overlaps nothing past 336 + 176)
+    EFB_BuffsHeader bh{};
+    bh.count = 1;
+    bh.flags = EFB_BUFFS_DROPPED | 0x80000000u;
+    bh.dropped = 2;
+    Put(buf, 512, bh);
+    EFB_Buff b{};
+    b.key = 7;
+    b.enhance_cnt = 3;
+    strcpy_s(b.buff_id, "buff_future");
+    const size_t slot1 = 552 + sizeof(EFB_Buff) + 16;
+    Put(buf, slot1, b);
+    memset(buf + slot1 + sizeof(EFB_Buff), 0xFF, 16); // element fields from the future
+
+    efb::Mapping m;
+    m.Attach(buf, sizeof(buf));
+    efb::Header rh;
+    CHECK(efb::ReadHeader(m, rh) == efb::Result::Ok && rh.fields.session == 7 && rh.fields.abi_minor == EFB_ABI_MINOR + 1);
+    CHECK(!rh.Find(EFB_SECTION_TEAM)); // out of bounds: treated as absent
+    efb::Section s;
+    CHECK(efb::ReadSection(m, rh, EFB_SECTION_TEAM, s) == efb::Result::Missing);
+    CHECK(efb::ReadSection(m, rh, EFB_SECTION_OPERATORS, s) == efb::Result::Ok && s.capacity() == 2);
+    const EFB_Operator ro = s.Element<EFB_Operator>(1);
+    CHECK(ro.present == 1 && ro.ultimate_sp == 42 && ro.sampled_at == 0); // missing trailing field reads as 0
+    CHECK(efb::ReadSection(m, rh, EFB_SECTION_BUFFS, s) == efb::Result::Ok && s.capacity() == 3);
+    const auto rbh = s.Head<EFB_BuffsHeader>();
+    CHECK(rbh.count == 1 && rbh.dropped == 2 && (rbh.flags & EFB_BUFFS_DROPPED));
+    CHECK(s.Element<EFB_Buff>(0).key == 0);
+    const EFB_Buff rb = s.Element<EFB_Buff>(1);
+    CHECK(rb.key == 7 && rb.enhance_cnt == 3 && !strcmp(rb.buff_id, "buff_future"));
+
+    // Events: start the cursor, then publish an unknown type and a buff event with a longer payload.
+    efb::EventCursor cursor;
+    efb::EventBatch batch;
+    CHECK(cursor.Poll(m, rh, batch) == efb::Result::Ok && batch.resync && batch.events.empty());
+    EFB_Event e{};
+    e.serial = 1;
+    e.type = 99;
+    e.payload_size = EFB_EVENT_PAYLOAD;
+    Put(buf, 4128, e);
+    e = EFB_Event{};
+    e.serial = 2;
+    e.type = EFB_EVENT_BUFF_ADDED;
+    e.payload_size = sizeof(EFB_BuffEventPayload) + 8;
+    EFB_BuffEventPayload p{};
+    p.key = 7;
+    p.buff_slot = 1;
+    strcpy_s(p.buff_id, "buff_future");
+    memcpy(e.payload, &p, sizeof(p));
+    Put(buf, 4128 + sizeof(EFB_Event) + 64, e);
+    Put<uint64_t>(buf, 4096 + offsetof(EFB_EventsHeader, head), 2);
+    CHECK(cursor.Poll(m, rh, batch) == efb::Result::Ok && !batch.resync && batch.events.size() == 2);
+    CHECK(batch.events[0].type == 99); // delivered; consumers skip types they do not know
+    const auto rp = efb::Payload<EFB_BuffEventPayload>(batch.events[1]);
+    CHECK(batch.events[1].type == EFB_EVENT_BUFF_ADDED && rp.key == 7 && rp.buff_slot == 1 && !strcmp(rp.buff_id, "buff_future"));
+
+    // Not this ABI.
+    h.abi_major = EFB_ABI_MAJOR + 1;
+    Put(buf, 0, h);
+    CHECK(efb::ReadHeader(m, rh) == efb::Result::Incompatible);
+    h.abi_major = EFB_ABI_MAJOR;
+    h.magic = 0;
+    Put(buf, 0, h);
+    CHECK(efb::ReadHeader(m, rh) == efb::Result::Incompatible);
+    std::puts("[OK] Reader handles newer and older minor layouts; rejects other ABIs");
+}
+// A reader thread, via the reference reader, while the game thread writes:
+//  - a buffs copy is never torn: every live entry has enhance_cnt == count;
+//  - events never run ahead of buffs: a key the events say is present is in
+//    the buffs read that follows, unless a later poll shows it finished.
+volatile LONG g_stopReader = 0;
+struct ReaderStats { volatile LONG failures, checks, orderChecks; };
+DWORD WINAPI ConcurrentReader(void* arg) {
+    auto* stats = static_cast<ReaderStats*>(arg);
+    volatile LONG* failures = &stats->failures;
+    efb::Mapping m;
+    if (!m.Open(g_mappingName)) { InterlockedIncrement(failures); return 0; }
+    efb::EventCursor cursor;
+    std::vector<uint32_t> present; // keys alive according to events
+    auto apply = [&](const efb::EventBatch& batch) {
+        if (batch.resync) present.clear();
+        for (const auto& e : batch.events) {
+            const uint32_t key = efb::Payload<EFB_BuffEventPayload>(e).key;
+            if (e.type == EFB_EVENT_BUFF_ADDED && efb::Payload<EFB_BuffEventPayload>(e).buff_slot >= 0) present.push_back(key);
+            if (e.type == EFB_EVENT_BUFF_FINISHED) present.erase(std::remove(present.begin(), present.end(), key), present.end());
+        }
+    };
+    while (!g_stopReader) {
+        efb::Header h;
+        efb::EventBatch first, second;
+        efb::Section buffs;
+        if (efb::ReadHeader(m, h) != efb::Result::Ok || cursor.Poll(m, h, first) != efb::Result::Ok) continue;
+        apply(first);
+        if (efb::ReadSection(m, h, EFB_SECTION_BUFFS, buffs) != efb::Result::Ok) continue;
+        const uint32_t count = buffs.Head<EFB_BuffsHeader>().count;
+        std::vector<uint32_t> inTable;
+        for (uint32_t i = 0; i < buffs.capacity(); ++i) {
+            const EFB_Buff b = buffs.Element<EFB_Buff>(i);
+            if (!b.key) continue;
+            inTable.push_back(b.key);
+            if (uint32_t(b.enhance_cnt) != count) InterlockedIncrement(failures);
+        }
+        if (inTable.size() != count) InterlockedIncrement(failures);
+        InterlockedIncrement(&stats->checks);
+        if (first.resync) continue; // events lost: nothing to compare against
+        InterlockedIncrement(&stats->orderChecks);
+        std::vector<uint32_t> missing;
+        for (uint32_t key : present)
+            if (std::find(inTable.begin(), inTable.end(), key) == inTable.end()) missing.push_back(key);
+        if (missing.empty() || cursor.Poll(m, h, second) != efb::Result::Ok) continue;
+        apply(second);
+        if (second.resync) continue;
+        for (uint32_t key : missing)
+            if (std::find(present.begin(), present.end(), key) != present.end()) InterlockedIncrement(failures);
+    }
+    return 0;
+}
+void TestConcurrentReader() {
     Reset();
     g_clock = RealQpc; // the reader thread uses real time
     FakeAbility ikut{};
     MakeAbility(ikut, 11);
-    static FakeBuff pool[64];
-    volatile LONG failures = 0;
-    HANDLE reader = CreateThread(nullptr, 0, TornReader, (void*)&failures, 0, nullptr);
+    static FakeBuff pool[24];
+    ReaderStats stats{};
+    HANDLE reader = CreateThread(nullptr, 0, ConcurrentReader, &stats, 0, nullptr);
     CHECK(reader);
     uint32_t uid = 5000;
-    for (int round = 0; round < 3000; ++round) {
-        const int count = 1 + round % 64;
-        for (int i = 0; i < 64; ++i) {
-            if (i < count) {
-                MakeBuff(pool[i], "buff_seq", ++uid, ikut, 11, ikut, 11, 10);
-                Put<int32_t>(pool[i].bytes, off.buffEnhance, count);
-                Report(pool[i], true);
-            }
+    // Run until the reader has checked enough (bounded), yielding each round
+    // so it can keep up with the event ring.
+    const ULONGLONG deadline = GetTickCount64() + 20000;
+    for (int round = 0; round < 3000 || stats.checks < 500 || stats.orderChecks < 200; ++round) {
+        CHECK(GetTickCount64() < deadline);
+        const int count = 1 + (round * 7) % 24;
+        for (int i = 0; i < count; ++i) {
+            MakeBuff(pool[i], "buff_seq", ++uid, ikut, 11, ikut, 11, 10);
+            Put<int32_t>(pool[i].bytes, off.buffEnhance, count);
+            Report(pool[i], true);
         }
         ++g_frame;
         Tick();
         for (int i = 0; i < count; ++i) Report(pool[i], false);
         ++g_frame;
         Tick();
+        SwitchToThread();
     }
     InterlockedExchange(&g_stopReader, 1);
     WaitForSingleObject(reader, INFINITE);
     CloseHandle(reader);
     g_clock = Clock;
-    CHECK(failures == 0);
-    std::puts("[OK] Concurrent reader never observes a torn snapshot");
+    CHECK(stats.failures == 0);
+    std::printf("[OK] Concurrent reader: no torn section, events never ahead of the buff table "
+        "(%ld reads, %ld ordering checks)\n", stats.checks, stats.orderChecks);
 }
 } // namespace test
 
@@ -356,16 +583,18 @@ int main() {
     g_frameClock = Frame;
     g_clock = Clock;
     CHECK(OpenShared());
+    CHECK(g_reader.Open(name) && g_reader.size() >= EFB_MAPPING_SIZE);
     SetUpOffsets();
     g_sampleIntervalMs = 0; // per-frame reads, so each step is observable
-
     TestAddRefreshFinish();
     TestSameFrameAndLost();
     TestDilation();
     TestOverflow();
     TestSessionAndLiveness();
     TestSampleInterval();
-    TestSeqlock();
+    TestSectionIndependence();
+    TestCompatibility();
+    TestConcurrentReader();
     std::puts("[PASS] EndfieldDataBridge offline data verification");
     return 0;
 }
