@@ -35,6 +35,11 @@ cl /nologo /utf-8 /O2 /MT /LD /EHsc /std:c++17 /W4 /permissive- /wd4505 ^
     /link /INCREMENTAL:NO /MACHINE:X64
 if errorlevel 1 exit /b 1
 echo [OK] %CD%\bin\EndfieldDataBridge.dll
+cl /nologo /utf-8 /O2 /MT /EHsc /std:c++17 /W4 /permissive- ^
+    /DWIN32_LEAN_AND_MEAN /DNOMINMAX tools\efb_reader.cpp /Fo:bin\efb_reader.obj /Fe:bin\efb_reader.exe ^
+    /link /INCREMENTAL:NO /MACHINE:X64
+if errorlevel 1 exit /b 1
+echo [OK] %CD%\bin\efb_reader.exe
 if /i not "%~1"=="/verify" exit /b 0
 
 rem Build an offline host from the official Core. This is not linked into the plugin.

@@ -72,8 +72,9 @@ int main() {
     CHECK(manifest->abi_major == APH_ABI_MAJOR);
     CHECK(manifest->required_minor == APH_ABI_MINOR);
     CHECK(manifest->architecture == APH_ARCH_X64);
-    CHECK(manifest->flags == (APH_PLUGIN_LIFECYCLE | APH_PLUGIN_LATE_LOAD));
-    CHECK(manifest->required_capabilities == APH_CAP_CORE);
+    CHECK(manifest->flags == (APH_PLUGIN_LIFECYCLE | APH_PLUGIN_LATE_LOAD |
+        APH_PLUGIN_MODULE_OBSERVER));
+    CHECK(manifest->required_capabilities == (APH_CAP_CORE | APH_CAP_HOOKS));
     CHECK(manifest->optional_capabilities == 0);
     CHECK(std::strcmp(manifest->id, "endfield.data_bridge") == 0);
     CHECK(attach(nullptr) == APH_E_ARGUMENT);
