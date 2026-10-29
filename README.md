@@ -1,12 +1,10 @@
 # EndfieldDataBridge
 
-《明日方舟：终末地》战斗数据桥接插件。插件只采集数据，不改动游戏画面，通过共享内存提供给外部小程序（如 EndfieldVT）读取：
+《明日方舟：终末地》战斗数据桥接插件。本插件仅读入数据，不修改游戏内容，通过共享内存提供给外部程序读取：
 
-- **技力（SP）**：当前值、上限（随模式变化，如 300 / 700 / 1000）、每格技力。
-- **干员**：四名干员的终结技充能、连携技冷却、当前操控角色。
-- **Buff / Debuff**：队友和敌人身上的状态，包括层数、剩余时间、持续时间、计时速率，以及拥有者、施加者（子 Buff 追溯到父 Buff 的施加者）和添加、刷新、层数变化、结束事件。
-
-采集在游戏线程上只做内存读写，不写文件、不走网络。
+- **技力（SP）**：当前值、上限、每格技力。
+- **干员**：终结技充能(Ultimate Energy)、连携技(Combo Skill)冷却、当前操控角色。
+- **Buff / Debuff**：己方和敌方的状态，包括层数、剩余时间、持续时间、计时速率，以及拥有者、施加者（子 Buff 追溯到父 Buff 的施加者）和添加、刷新、层数变化、结束事件。
 
 ## 下载
 
@@ -26,13 +24,15 @@ bin/EndfieldDataBridge.dll  → 游戏目录/plugin/EndfieldDataBridge.dll
 
 ## 使用说明
 
-1. 按上述方式安装后启动游戏，进入战斗。插件在战斗 HUD 显示时每 50 ms 采集一次，写入共享内存 `Local\EndfieldDataBridge.v1`。
-2. 外部小程序按 [`include/endfield_bridge.h`](include/endfield_bridge.h) 的布局只读映射这块内存。头文件开头写明了读取规则：
+1. 按上述方式安装后启动游戏，进入战斗。插件在战斗时按采样频率（默认 50ms）读取技力、干员和 Buff 计时，Buff 的添加和结束每帧处理，写入共享内存 `Local\EndfieldDataBridge.v2`。
+2. 外部程序按 [`include/endfield_bridge.h`](include/endfield_bridge.h) 的布局只读映射这块内存。头文件有读取规则，[`include/endfield_bridge_reader.h`](include/endfield_bridge_reader.h) 是这些规则的 C++ 参考实现：
    - `seq` 为奇数表示正在写入；读取前后 `seq` 相同才算一次完整读取。
+   - 游戏崩溃后 `active` 可能仍为 1，需用 `writer_pid` 和 `writer_start_time` 确认写入进程仍在运行。
+   - 技力、各干员、Buff 各自带 `sampled_at`，超过约 0.5 秒未更新（暂停、HUD 隐藏）即视为过期；`valid_mask` 表示本次会话中哪些部分已采到。
+   - `flags` 标记 Buff 表可能不完整：`PARTIAL` 表示插件启用前已存在的 Buff 可能缺失，`DROPPED` 表示表满后有 Buff 未记录（数量见 `buffs_dropped`）。
    - `session` 变化时丢弃缓存，重新读取 Buff 表。
-   - Buff 的 `key` 在刷新后保持不变；事件环 `events` 按顺序记录添加、刷新、层数变化和结束。
-   - 剩余时间按 `life_time - min(距 sampled_at 的秒数, 0.25) × time_dilation` 计算，过场减速或暂停时也能对上游戏内倒计时。
-   - `published_at` 不再更新（暂停、HUD 隐藏）时停止倒计时；`active` 为 0 时数据已失效。
+   - Buff 的 `key` 在刷新后保持不变；事件环 `events` 按顺序记录每一次添加、刷新、层数变化和结束，`frame` 和 `at` 为游戏报告该变化的帧与时刻。
+   - 剩余时间按 `life_time - min(距 sampled_at 的秒数, 0.25) × time_dilation` 计算。
 3. 自带测试工具 `bin\efb_reader.exe`（从源码编译后生成），游戏运行时在终端中执行：
 
    ```powershell
@@ -41,7 +41,14 @@ bin/EndfieldDataBridge.dll  → 游戏目录/plugin/EndfieldDataBridge.dll
    .\bin\efb_reader.exe --events   # 滚动显示 Buff 事件
    ```
 
-4. 排查问题时，在 `plugin\` 目录中新建空文件 `EndfieldDataBridge_debug.txt` 并重启游戏，插件会写入详细日志 `EndfieldDataBridge_log.txt`，并导出元数据 `EndfieldDataBridge_dump.txt`。正常使用时请删除该文件。
+## 基础配置
+
+在 Manager 的插件设置中修改以下选项，修改后自动保存并立即生效：
+
+- **调试日志**（默认关闭）：开启时写入 `plugin\EndfieldDataBridge_log.txt`，插件启用时同时导出元数据 `plugin\EndfieldDataBridge_dump.txt`；关闭时不写任何文件。
+- **采样频率**（默认 50ms，可选 50ms / 100ms / 150ms / 200ms）：读取技力、干员和 Buff 计时的间隔。间隔越大开销越小，但原地刷新和层数变化最多晚一个间隔才出现；Buff 的添加和结束不受影响。当前值也写在共享内存的 `sample_interval_ms` 中。
+
+设置保存在 `plugin\config\applepie.endfield.data_bridge.ini`。
 
 插件目录只在启动时扫描，替换 DLL 后需要重启游戏。
 
@@ -73,14 +80,16 @@ cd D:\Workspace\src\EndfieldDataBridge
 .\build.bat /verify
 ```
 
-验证宿主链接相邻仓库的真实 Core 和其 MinHook 依赖，再加载实际生成的 DLL。检查只读清单、导出入口、Attach、启用、停用恢复、再次启用及旧 epoch 拒绝。验证在独立进程中运行，不需要启动游戏。
+验证宿主链接相邻仓库的真实 Core 和其 MinHook 依赖，再加载实际生成的 DLL。检查只读清单、导出入口、Attach、启用、停用恢复、再次启用及旧 epoch 拒绝。随后运行数据验证：用伪造的 Buff 对象检查刷新合并、层数事件、同帧添加结束、对象复用、溢出计数、存活判断和并发读取一致性。验证在独立进程中运行，不需要启动游戏。
 
 ## 源码
 
 - `src/plugin.cpp`：生命周期、IL2CPP 字段解析、UI hook 采集和共享内存发布。
-- `include/endfield_bridge.h`：共享内存布局和读取规则，供外部小程序使用。
+- `include/endfield_bridge.h`：共享内存布局和读取规则，供外部程序使用。
+- `include/endfield_bridge_reader.h`：读取规则的 C++ 参考实现（快照、进程存活、过期判断）。
 - `tools/efb_reader.cpp`：共享内存的测试读取工具。
 - `build.bat`：MSVC 构建及可选离线验证。
 - `tests/verify.cpp`：实际 DLL 的离线生命周期验证。
+- `tests/data_test.cpp`：Buff 跟踪、事件、溢出、存活判断和并发读取的离线验证。
 
 使用仓库现有的 [AGPL-3.0 许可证](LICENSE)。
