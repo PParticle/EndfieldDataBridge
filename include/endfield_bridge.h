@@ -13,29 +13,51 @@
 // Time: every *_at field is a QueryPerformanceCounter value of this machine;
 // seconds = (now_qpc - x_at) / qpc_frequency.
 //
+// Liveness: the mapping outlives a crashed game while any reader holds it, so
+// `active` alone proves nothing. The writer is alive only if a process with
+// writer_pid exists, is still running, and its creation time (GetProcessTimes)
+// equals writer_start_time.
+//
+// Freshness: published_at is the last write of any kind. Each part carries its
+// own sampled_at; treat a part as stale when it is more than ~0.5 s older than
+// now (battle HUD hidden, game paused). valid_mask tells which parts have been
+// sampled at least once in this session.
+//
 // Buff timers follow game time, which slows down or stops in cinematics. To
 // show a smooth countdown between samples:
 //   elapsed   = min(seconds since sampled_at, 0.25)
 //   life_left = max(life_time - elapsed * time_dilation, 0)
-// Stop extrapolating when published_at goes stale (game paused, HUD hidden).
-// Treat the data as offline when active == 0 or writer_pid is not running.
+//
+// Completeness: the buff table holds buffs reported by the squad portraits and
+// enemy head bars. `flags` says when it may be incomplete (see EFB_FLAG_*).
 //
 // Change tracking: `session` changes whenever the table restarts (plugin
 // enabled again, game restarted); drop everything cached and re-read. Within a
-// session, a buff keeps its `key` across refreshes. Events give the order of
-// discrete changes; if event_head advanced by more than EFB_MAX_EVENTS since
-// your last read, events were lost: re-read the buff table instead.
+// session, a buff keeps its `key` across refreshes. Every tracked add and
+// finish produces one event, at most one frame after the game reported it;
+// `at` and `frame` give the moment the game reported it. In-place refreshes and
+// stack changes are found when timers are re-read, every sample_interval_ms;
+// several stack changes within one interval appear as one BUFF_ENHANCED. If
+// event_head advanced by more than EFB_MAX_EVENTS since your last read, events
+// were lost: re-read the buff table instead.
 #pragma once
 #include <stdint.h>
 
-#define EFB_MAPPING_NAME L"Local\\EndfieldDataBridge.v1"
+#define EFB_MAPPING_NAME L"Local\\EndfieldDataBridge.v2"
 #define EFB_MAGIC 0x31424645u /* "EFB1" */
-#define EFB_LAYOUT_VERSION 1u
+#define EFB_LAYOUT_VERSION 2u
 #define EFB_MAX_OPERATORS 4
 #define EFB_MAX_BUFFS 256
 #define EFB_MAX_EVENTS 512
 #define EFB_NAME_LEN 64
 #define EFB_ID_LEN 96
+
+// EFB_Shared.flags
+#define EFB_FLAG_BUFFS_PARTIAL 0x1u /* session began while the HUD was running: older buffs may be missing */
+#define EFB_FLAG_BUFFS_DROPPED 0x2u /* table was full: buffs_dropped buffs were never tracked this session */
+// EFB_Shared.valid_mask: sampled at least once in this session
+#define EFB_VALID_TEAM 0x1u
+#define EFB_VALID_OPERATOR(i) (0x2u << (i))
 
 // Beyond.Gameplay.Core.FactionIndex
 enum EFB_Faction { EFB_FACTION_INVALID = 0, EFB_FACTION_UNKNOWN = 1, EFB_FACTION_GOOD = 2,
@@ -52,6 +74,8 @@ enum EFB_EventType {
     EFB_EVENT_BUFF_ENHANCED = 3,  // enhance_cnt (stacks) changed
     EFB_EVENT_BUFF_FINISHED = 4,  // key left the table; finish_reason says why
 };
+// A buff added and finished within one frame produces BUFF_ADDED and
+// BUFF_FINISHED with buff_slot == -1 and never appears in buffs[].
 
 #pragma pack(push, 8)
 // An AbilitySystem as captured when the buff was added.
@@ -115,10 +139,12 @@ typedef struct EFB_Event {
     int32_t type;              // EFB_EventType
     int32_t finish_reason;     // BUFF_FINISHED only, else 0
     uint32_t key;
-    int32_t buff_slot;         // index into buffs[] (already cleared for BUFF_FINISHED)
+    int32_t buff_slot;         // index into buffs[] (already cleared for BUFF_FINISHED), -1 = none
     uint32_t owner_uid;
     int32_t enhance_cnt;
-    int64_t at;
+    int32_t frame;             // game frame (UnityEngine.Time.frameCount) the change was seen in
+    uint32_t reserved;
+    int64_t at;                // when the game reported it (QPC)
     char buff_id[EFB_ID_LEN];
 } EFB_Event;
 
@@ -128,12 +154,18 @@ typedef struct EFB_Shared {
     uint32_t layout_version;   // EFB_LAYOUT_VERSION
     uint32_t layout_size;      // sizeof(EFB_Shared)
     uint32_t session;
-    uint32_t active;           // 0 while the plugin is disabled or the game is closing
+    uint32_t active;           // 0 while the plugin is disabled; stays 1 if the game crashes
     uint32_t writer_pid;
-    uint32_t buff_count;       // live entries in buffs[]
+    uint32_t flags;            // EFB_FLAG_*
+    uint64_t writer_start_time; // writer process creation time (FILETIME as uint64)
     int64_t qpc_frequency;
-    int64_t published_at;      // last write by the game thread
+    int64_t session_started_at;
+    int64_t published_at;      // last write of any kind
     uint64_t event_head;       // serial of the newest event, 0 = none
+    uint32_t buff_count;       // live entries in buffs[]
+    uint32_t valid_mask;       // EFB_VALID_*
+    uint32_t buffs_dropped;    // never tracked this session (EFB_FLAG_BUFFS_DROPPED)
+    uint32_t sample_interval_ms; // Manager setting: 50, 100, 150 or 200
     EFB_Team team;
     EFB_Operator operators[EFB_MAX_OPERATORS]; // index = char_index
     EFB_Buff buffs[EFB_MAX_BUFFS];             // unordered; skip key == 0
@@ -146,6 +178,6 @@ static_assert(sizeof(EFB_Unit) == 72, "EFB_Unit layout");
 static_assert(sizeof(EFB_Team) == 24, "EFB_Team layout");
 static_assert(sizeof(EFB_Operator) == 96, "EFB_Operator layout");
 static_assert(sizeof(EFB_Buff) == 568, "EFB_Buff layout");
-static_assert(sizeof(EFB_Event) == 136, "EFB_Event layout");
-static_assert(sizeof(EFB_Shared) == 215504, "EFB_Shared layout");
+static_assert(sizeof(EFB_Event) == 144, "EFB_Event layout");
+static_assert(sizeof(EFB_Shared) == 219632, "EFB_Shared layout");
 #endif

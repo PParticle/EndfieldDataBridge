@@ -33,6 +33,35 @@ APH_OwnerStatus State(applepie::Client& client, uint32_t expected) {
     }
 }
 
+bool WaitFor(bool (*ready)(const wchar_t*), const wchar_t* path) {
+    const ULONGLONG deadline = GetTickCount64() + 5000;
+    while (!ready(path)) {
+        if (GetTickCount64() >= deadline) return false;
+        Sleep(1); // saves complete on a Manager worker; no completion event here
+    }
+    return true;
+}
+bool Exists(const wchar_t* path) { return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES; }
+// Deletable means the plugin no longer holds the log open.
+bool Deleted(const wchar_t* path) { return DeleteFileW(path) || GetLastError() == ERROR_FILE_NOT_FOUND; }
+// Saves debug and sample_interval; interval nullptr keeps the stored one.
+void SaveConfig(applepie::Client& client, const APH_ConfigApi& config, bool debug, const char* interval) {
+    APH_ConfigSnapshot state{};
+    APH_ConfigValue values[2]{};
+    const ULONGLONG deadline = GetTickCount64() + 5000;
+    for (;;) {
+        CHECK(config.snapshot(client.owner(), sizeof(state), &state, 2, values) == APH_OK);
+        if (!state.pending) break;
+        CHECK(GetTickCount64() < deadline);
+        Sleep(1);
+    }
+    CHECK(state.field_count == 2 && values[0].type == APH_CONFIG_BOOL && values[1].type == APH_CONFIG_ENUM);
+    values[0].integer = debug;
+    if (interval) strcpy_s(values[1].text, interval);
+    const APH_Result r = config.save(client.owner(), state.revision, 2, values);
+    CHECK(r == APH_PENDING || r == APH_OK);
+}
+
 uint64_t Enable(applepie::Client& client, APH_EnableFn enable) {
     const uint64_t epoch = hub::begin_enable(client.owner());
     CHECK(epoch != 0);
@@ -53,6 +82,16 @@ int main() {
     ++filename;
     CHECK(wcscpy_s(filename, MAX_PATH - (filename - path),
         L"EndfieldDataBridge.dll") == 0);
+
+    // Settings and log live next to the DLL; start from defaults.
+    wchar_t log[MAX_PATH]{}, ini[MAX_PATH]{};
+    wcscpy_s(log, path);
+    wcscpy_s(ini, path);
+    wcscpy_s(std::wcsrchr(log, L'\\') + 1, MAX_PATH - (std::wcsrchr(log, L'\\') + 1 - log), L"EndfieldDataBridge_log.txt");
+    wcscpy_s(std::wcsrchr(ini, L'\\') + 1, MAX_PATH - (std::wcsrchr(ini, L'\\') + 1 - ini),
+        L"config\\applepie.endfield.data_bridge.ini");
+    DeleteFileW(ini);
+    CHECK(Deleted(log));
 
     // Keep the DLL resident: Core retains its registered lifecycle callbacks.
     const HMODULE dll = LoadLibraryW(path);
@@ -97,6 +136,34 @@ int main() {
     CHECK(enable(owner + 1, 1) == APH_E_ARGUMENT);
     CHECK(enable(owner, 1) == APH_E_STALE);
     std::puts("[OK] Official Core attach, idempotent attach and owner/epoch guards");
+
+    APH_ConfigApi config{};
+    CHECK(observer.Service(config) == APH_OK);
+    APH_ConfigField field{};
+    CHECK(config.field(owner, 0, sizeof(field), &field) == APH_OK);
+    CHECK(!std::strcmp(field.key, "debug") && field.type == APH_CONFIG_BOOL && field.initial.integer == 0);
+    CHECK(config.field(owner, 1, sizeof(field), &field) == APH_OK);
+    CHECK(!std::strcmp(field.key, "sample_interval") && field.type == APH_CONFIG_ENUM &&
+        field.option_count == 4 && !std::strcmp(field.initial.text, "50ms"));
+    const char* intervals[] = {"50ms", "100ms", "150ms", "200ms"};
+    for (uint32_t i = 0; i < 4; ++i) {
+        APH_ConfigOption option{};
+        CHECK(config.option(owner, 1, i, sizeof(option), &option) == APH_OK && !std::strcmp(option.value, intervals[i]));
+    }
+    CHECK(!Exists(log)); // debug defaults to off: no file at all
+    SaveConfig(observer, config, true, nullptr);
+    CHECK(WaitFor(Exists, log));
+    SaveConfig(observer, config, false, nullptr);
+    CHECK(WaitFor(Deleted, log));
+    {
+        // An unlisted interval is rejected by the host before it reaches the plugin.
+        APH_ConfigSnapshot state{};
+        APH_ConfigValue values[2]{};
+        CHECK(config.snapshot(owner, sizeof(state), &state, 2, values) == APH_OK && !state.pending);
+        strcpy_s(values[1].text, "10ms");
+        CHECK(config.save(owner, state.revision, 2, values) == APH_E_ARGUMENT);
+    }
+    std::puts("[OK] Debug and sample-interval settings registered; debug toggles the log file at runtime");
 
     const uint64_t first = Enable(observer, enable);
     CHECK(enable(owner, first) == APH_E_STALE);

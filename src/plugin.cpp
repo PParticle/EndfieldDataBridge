@@ -18,9 +18,9 @@
 
 // Read-only observer for SP, squad ultimate energy / combo CD and buffs.
 // UI hooks sample on the game thread and publish into shared memory
-// (include/endfield_bridge.h); the game thread does no file or socket I/O.
-// EndfieldDataBridge_debug.txt in the plugin directory enables the metadata
-// dump and detailed probe log.
+// (include/endfield_bridge.h). The Manager "debug" setting enables
+// plugin\EndfieldDataBridge_log.txt and, at enable, the metadata dump;
+// with it off the plugin writes no files.
 
 namespace {
 applepie::Client g_client;
@@ -137,9 +137,11 @@ bool WorkOpen() {
         GetTickCount64() < g_deadline;
 }
 std::atomic<bool>& ActiveFlag();
+void MarkWriterStopped();
 void BeginRuntimeStop() {
     g_stopping.store(true);
     ActiveFlag() = false;
+    MarkWriterStopped();
     if (g_cancel) SetEvent(g_cancel);
     // Give an in-flight metadata query a bounded chance to leave IL2CPP.
     for (int i = 0; i < 500 && g_inMetadata.load(); ++i) Sleep(1);
@@ -400,6 +402,15 @@ bool DumpAll(void** assemblies, size_t count) {
         const char* imageName = il.il2cpp_image_get_name(image);
         for (const auto& t : kTargets)
             if (void* k = il.il2cpp_class_from_name(image, t[0], t[1])) QueueDetail(k);
+        // Nested Buff.BuffContainer: reach it through the field that holds it.
+        if (void* as = il.il2cpp_class_from_name(image, "Beyond.Gameplay.Core", "AbilitySystem")) {
+            void* it = nullptr;
+            while (void* f = il.il2cpp_class_get_fields(as, &it)) {
+                const char* n = il.il2cpp_field_get_name(f);
+                if (n && !strcmp(n, "m_buffContainer"))
+                    if (void* k = il.il2cpp_class_from_type(il.il2cpp_field_get_type(f))) QueueDetail(k);
+            }
+        }
         const size_t n = il.il2cpp_image_get_class_count(image);
         Out("# image %s classes=%zu\n", imageName ? imageName : "?", n);
         for (size_t c = 0; c < n; ++c) {
@@ -558,8 +569,8 @@ void LogEnum(void* klass) {
 // Probe bodies use only plain C data so the SEH wrappers need no unwinding.
 std::atomic<long> g_probeLines{0}, g_probeFaults{0};
 constexpr long PROBE_LINE_BUDGET = 60000;
-bool g_debug = false;
-bool ProbeLogAllowed() { return g_debug && g_probeLines.fetch_add(1) < PROBE_LINE_BUDGET; }
+std::atomic<bool> g_debug{false};
+bool ProbeLogAllowed() { return g_debug.load() && g_probeLines.fetch_add(1) < PROBE_LINE_BUDGET; }
 
 template<class T> T At(void* obj, int offset) { return *reinterpret_cast<T*>(static_cast<char*>(obj) + offset); }
 void ReadManagedString(void* str, char* out, int size) {
@@ -602,23 +613,43 @@ int FactionOf(void* ability) {
 }
 
 // ---- Shared memory (include/endfield_bridge.h) ----
-// The game thread is the only writer once probes are active. It stages
-// readings in plain globals and copies them into the view every
-// SAMPLE_INTERVAL inside one seqlock write section.
+// Every change happens inside Write(), which holds g_dataLock and the
+// seqlock, so readers see the buff table, events and counters change
+// together. Writers: the game thread while probes are active; the worker
+// only between sessions.
 HANDLE g_mapping = nullptr;
 EFB_Shared* g_view = nullptr;
+const wchar_t* g_mappingName = EFB_MAPPING_NAME; // tests use a private name
+SRWLOCK g_dataLock = SRWLOCK_INIT;
 int64_t g_qpcFreq = 1;
-int64_t QpcNow() { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
+int64_t RealQpc() { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
+int64_t (*g_clock)() = RealQpc;
+int64_t QpcNow() { return g_clock(); }
 float SecondsBetween(int64_t from, int64_t to) { return float(double(to - from) / double(g_qpcFreq)); }
-void BeginWrite() { g_view->seq |= 1; MemoryBarrier(); }
-void EndWrite() { MemoryBarrier(); g_view->seq += 1; }
+uint64_t FileTimeValue(const FILETIME& t) { return (uint64_t(t.dwHighDateTime) << 32) | t.dwLowDateTime; }
+uint64_t ProcessStartTime() {
+    FILETIME created{}, exited{}, kernel{}, user{};
+    return GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user) ? FileTimeValue(created) : 0;
+}
+template<class Fn> void Write(Fn fn) {
+    AcquireSRWLockExclusive(&g_dataLock);
+    g_view->seq |= 1; // odd: writing
+    MemoryBarrier();
+    __try { fn(); }
+    __finally {
+        g_view->published_at = QpcNow();
+        MemoryBarrier();
+        g_view->seq += 1;
+        ReleaseSRWLockExclusive(&g_dataLock);
+    }
+}
 bool OpenShared() {
     if (g_view) return true;
     LARGE_INTEGER f;
     QueryPerformanceFrequency(&f);
     g_qpcFreq = f.QuadPart;
     g_mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(EFB_Shared),
-        EFB_MAPPING_NAME);
+        g_mappingName);
     if (!g_mapping) { LogF("[SHM] CreateFileMapping failed: %lu", GetLastError()); return false; }
     // Exists when a reader still holds the view of a game that has exited.
     const bool reused = GetLastError() == ERROR_ALREADY_EXISTS;
@@ -629,32 +660,37 @@ bool OpenShared() {
         g_mapping = nullptr;
         return false;
     }
+    // Keep session and event serials increasing for a reader that outlived the old writer.
     const bool ours = reused && g_view->magic == EFB_MAGIC && g_view->layout_size == sizeof(EFB_Shared);
     const uint32_t session = ours ? g_view->session : 0;
     const uint64_t head = ours ? g_view->event_head : 0;
-    BeginWrite();
-    memset(reinterpret_cast<char*>(g_view) + sizeof(g_view->seq), 0, sizeof(EFB_Shared) - sizeof(g_view->seq));
-    g_view->magic = EFB_MAGIC;
-    g_view->layout_version = EFB_LAYOUT_VERSION;
-    g_view->layout_size = sizeof(EFB_Shared);
-    g_view->session = session;
-    g_view->event_head = head;
-    g_view->writer_pid = GetCurrentProcessId();
-    g_view->qpc_frequency = g_qpcFreq;
-    EndWrite();
-    LogF("[SHM] %ls ready (%u bytes%s)", EFB_MAPPING_NAME, unsigned(sizeof(EFB_Shared)),
-        reused ? ", reused" : "");
+    Write([&] {
+        memset(reinterpret_cast<char*>(g_view) + sizeof(g_view->seq), 0, sizeof(EFB_Shared) - sizeof(g_view->seq));
+        g_view->magic = EFB_MAGIC;
+        g_view->layout_version = EFB_LAYOUT_VERSION;
+        g_view->layout_size = sizeof(EFB_Shared);
+        g_view->session = session;
+        g_view->event_head = head;
+        g_view->writer_pid = GetCurrentProcessId();
+        g_view->writer_start_time = ProcessStartTime();
+        g_view->qpc_frequency = g_qpcFreq;
+    });
+    LogF("[SHM] %ls ready (%u bytes%s)", g_mappingName, unsigned(sizeof(EFB_Shared)), reused ? ", reused" : "");
     return true;
 }
-constexpr double SAMPLE_INTERVAL_S = 0.05;
+// Stop path: may run on any thread while the game thread is inside Write().
+void MarkWriterStopped() {
+    if (g_view) InterlockedExchange(reinterpret_cast<volatile LONG*>(&g_view->active), 0);
+}
+// Manager setting "sample_interval"; 0 samples every frame (tests only).
+std::atomic<int> g_sampleIntervalMs{50};
 bool SampleDue(int64_t& last, int64_t now) {
-    if (last && double(now - last) < SAMPLE_INTERVAL_S * double(g_qpcFreq)) return false;
+    if (last && double(now - last) * 1000 < double(g_sampleIntervalMs.load()) * double(g_qpcFreq)) return false;
     last = now;
     return true;
 }
 
 // ---- SP via AtbNode.LateTick -> BattleManager ----
-EFB_Team g_team{};
 int64_t g_teamSampledAt = 0;
 ULONGLONG g_lastAtbLog = 0;
 float g_lastAtb = -1, g_lastAtbMax = -1;
@@ -665,22 +701,26 @@ void ProbeAtb(void* node) {
     void* bm = CallGetter<void*>(g_mGetBattleManager, node);
     if (!bm) return;
     void* setting = g_mGetSkillSetting ? CallGetter<void*>(g_mGetSkillSetting, node) : nullptr;
-    g_team.atb = At<float>(bm, off.bmAtb);
-    g_team.atb_max = At<float>(bm, off.bmAtbMax);
-    g_team.atb_per_cell = setting && off.setPerCell >= 0 ? At<int32_t>(setting, off.setPerCell) : -1;
-    g_team.sampled_at = now;
+    EFB_Team team{};
+    team.atb = At<float>(bm, off.bmAtb);
+    team.atb_max = At<float>(bm, off.bmAtbMax);
+    team.atb_per_cell = setting && off.setPerCell >= 0 ? At<int32_t>(setting, off.setPerCell) : -1;
+    team.sampled_at = now;
+    Write([&] {
+        g_view->team = team;
+        g_view->valid_mask |= EFB_VALID_TEAM;
+    });
     const ULONGLONG tick = GetTickCount64();
-    const bool changed = g_team.atb - g_lastAtb > 0.5f || g_lastAtb - g_team.atb > 0.5f ||
-        g_team.atb_max != g_lastAtbMax;
+    const bool changed = team.atb - g_lastAtb > 0.5f || g_lastAtb - team.atb > 0.5f || team.atb_max != g_lastAtbMax;
     if (!(changed && tick - g_lastAtbLog >= 200) && tick - g_lastAtbLog < 5000) return;
-    g_lastAtb = g_team.atb; g_lastAtbMax = g_team.atb_max; g_lastAtbLog = tick;
+    g_lastAtb = team.atb; g_lastAtbMax = team.atb_max; g_lastAtbLog = tick;
     if (ProbeLogAllowed())
-        LogF("[ATB] t=%llu atb=%.2f max=%.2f perCell=%d", tick, g_team.atb, g_team.atb_max, g_team.atb_per_cell);
+        LogF("[ATB] t=%llu atb=%.2f max=%.2f perCell=%d", tick, team.atb, team.atb_max, team.atb_per_cell);
 }
+
 // ---- Squad slots via SquadIcon.LateTick: ultimate energy + combo CD ----
-struct SquadSlot { void* ability; uint32_t uid; bool main; };
+struct SquadSlot { void* ability; uint32_t uid; };
 SquadSlot g_squad[EFB_MAX_OPERATORS]{};
-EFB_Operator g_ops[EFB_MAX_OPERATORS]{};
 int64_t g_opSampledAt[EFB_MAX_OPERATORS]{};
 struct SlotLog { ULONGLONG at; float ult, cd; bool main; };
 SlotLog g_slotLog[EFB_MAX_OPERATORS]{};
@@ -712,24 +752,25 @@ void ProbeSquad(void* icon) {
     const bool empty = off.sqEmpty >= 0 && At<bool>(icon, off.sqEmpty);
     const bool main = off.sqMain >= 0 && At<bool>(icon, off.sqMain);
     const bool live = !empty && AbilityPtrLive(ability);
-    g_squad[index] = {live ? ability.object : nullptr, live ? ability.uid : 0, main};
-    EFB_Operator& op = g_ops[index];
+    g_squad[index] = {live ? ability.object : nullptr, live ? ability.uid : 0};
+    EFB_Operator op{};
     op.present = live;
     op.is_main_character = main;
     op.instance_uid = g_squad[index].uid;
+    op.combo_cd_remaining = op.combo_cooldown = -1;
     op.sampled_at = now;
-    if (!live) {
-        op.entity_name[0] = 0;
-        op.ultimate_sp = op.max_ultimate_sp = 0;
-        op.combo_cd_remaining = op.combo_cooldown = -1;
-        return;
+    if (live) {
+        EntityName(ability.object, op.entity_name, sizeof(op.entity_name));
+        op.ultimate_sp = At<float>(ability.object, off.asUltSp);
+        op.max_ultimate_sp = g_mMaxUltSp ? CallGetter<float>(g_mMaxUltSp, ability.object) : -1;
+        void* combo = FindSkill(ability.object, 6); // SkillType.ComboSkill
+        if (combo && g_mCdRemaining) op.combo_cd_remaining = CallGetter<float>(g_mCdRemaining, combo);
+        if (combo && g_mCooldown) op.combo_cooldown = CallGetter<float>(g_mCooldown, combo);
     }
-    EntityName(ability.object, op.entity_name, sizeof(op.entity_name));
-    op.ultimate_sp = At<float>(ability.object, off.asUltSp);
-    op.max_ultimate_sp = g_mMaxUltSp ? CallGetter<float>(g_mMaxUltSp, ability.object) : -1;
-    void* combo = FindSkill(ability.object, 6); // SkillType.ComboSkill
-    op.combo_cd_remaining = combo && g_mCdRemaining ? CallGetter<float>(g_mCdRemaining, combo) : -1;
-    op.combo_cooldown = combo && g_mCooldown ? CallGetter<float>(g_mCooldown, combo) : -1;
+    Write([&] {
+        g_view->operators[index] = op;
+        g_view->valid_mask |= EFB_VALID_OPERATOR(index);
+    });
     SlotLog& last = g_slotLog[index];
     const ULONGLONG tick = GetTickCount64();
     const float ult = op.ultimate_sp, cd = op.combo_cd_remaining;
@@ -741,36 +782,55 @@ void ProbeSquad(void* icon) {
         LogF("[SQUAD] t=%llu slot=%d main=%d name=%s ult=%.2f/%.2f cd=%.2f/%.2f", tick, index, int(main),
             op.entity_name, ult, op.max_ultimate_sp, cd, op.combo_cooldown);
 }
+
 // ---- Buff table: buffs seen through squad portraits and enemy head bars ----
-// Identity, owner and source are captured once on add; timers are re-read
-// from the live Buff object every sample, so consumers never run their own
-// clocks. The game refreshes a buff either in place (passed_time restarts) or
-// as finish(old uid) + add(new uid) in one frame, in either order. The second
-// form waits for the frame to end and is merged so the key survives.
+// Identity, owner and source are captured once on add; timers and stacks are
+// re-read from the live Buff object every sample interval, so consumers never
+// run their own clocks. An add or finish reported by the UI is settled at the
+// first hook call of the next frame, because the game refreshes some buffs
+// as finish(old uid) + add(new uid) in one frame, in either order; that pair
+// becomes one BUFF_REFRESHED and keeps the key. Other buffs restart in place
+// (passed_time drops), which the per-frame read reports the same way.
 enum TrackState : uint8_t { TRACK_FREE, TRACK_NEW, TRACK_LIVE, TRACK_FINISHED };
 struct TrackedBuff {
     TrackState state;
-    int32_t frame;             // frame of the pending add or finish
-    int32_t reason;            // FinishReason of the finish, EFB_FINISH_LOST if none came
+    int32_t addFrame, finishFrame;
+    int64_t addAt, finishAt;   // when the UI reported it
+    int32_t reason;            // FinishReason, EFB_FINISH_LOST when none came
     void* buff;                // valid only while buff->instanceUid == info.instance_uid
     void* ownerAbility;
-    int64_t finishedSince;     // first sample that saw m_isFinished without a finish event
+    int64_t finishedSince;     // first frame m_isFinished was seen without a finish report
+    int64_t rateAt;            // time_dilation baseline
+    float ratePassed;
     char parentClass[48];      // debug: non-buff parent root
     EFB_Buff info;             // what gets published
 };
 TrackedBuff g_tracked[EFB_MAX_BUFFS]{};
 uint32_t g_nextKey = 1;
+bool g_buffsDirty = false;     // a NEW or FINISHED entry waits for settlement
+int32_t g_settledFrame = INT32_MIN, g_tickedFrame = INT32_MIN;
 void* g_buffClass = nullptr;
 void* g_mFrameCount = nullptr;
 
-int32_t FrameNow() {
+int32_t UnityFrame() {
     using Fn = int32_t (*)(void*);
     if (g_mFrameCount) return reinterpret_cast<Fn>(*reinterpret_cast<void**>(g_mFrameCount))(g_mFrameCount);
     return int32_t(GetTickCount64() / 16); // fallback: ~one frame at 60 fps
 }
+int32_t (*g_frameClock)() = UnityFrame;
+int32_t FrameNow() { return g_frameClock(); }
 bool IsBuff(void* obj) {
     for (void* k = obj ? il.il2cpp_object_get_class(obj) : nullptr; k; k = il.il2cpp_class_get_parent(k))
         if (k == g_buffClass) return true;
+    return false;
+}
+// Recently finished or dropped uids: a finish for one of these is a duplicate
+// from another panel, not evidence of a missed add.
+uint32_t g_recentUids[128]{};
+unsigned g_recentNext = 0;
+void RememberUid(uint32_t uid) { g_recentUids[g_recentNext++ % 128] = uid; }
+bool IsRecentUid(uint32_t uid) {
+    for (uint32_t u : g_recentUids) if (u == uid) return true;
     return false;
 }
 void CaptureUnit(EFB_Unit& u, const ObjPtr& p) {
@@ -825,12 +885,12 @@ void CaptureBuff(TrackedBuff& t, void* buff, uint32_t uid, int64_t now) {
     b.time_dilation = 1;
     b.sampled_at = now;
 }
-void LogBuff(const char* tag, const TrackedBuff& t) {
+void LogBuff(const char* tag, const TrackedBuff& t, int32_t frame) {
     if (!ProbeLogAllowed()) return;
     const EFB_Buff& b = t.info;
-    LogF("[BUFF%s] t=%llu key=%u uid=%u id=%s owner=%s(%d f=%d) source=%s(%d f=%d) root=%s(%d f=%d) "
+    LogF("[BUFF%s] t=%llu frame=%d key=%u uid=%u id=%s owner=%s(%d f=%d) source=%s(%d f=%d) root=%s(%d f=%d) "
         "parent=%s%s debuff=%d life=%.2f/%.2f passed=%.2f dil=%.2f stacks=%d lifeType=%u reason=%d icon=%s",
-        tag, GetTickCount64(), b.key, b.instance_uid, b.buff_id,
+        tag, GetTickCount64(), frame, b.key, b.instance_uid, b.buff_id,
         b.owner.entity_name, b.owner.char_index, b.owner.faction,
         b.source.entity_name, b.source.char_index, b.source.faction,
         b.root_source.entity_name, b.root_source.char_index, b.root_source.faction,
@@ -840,42 +900,18 @@ void LogBuff(const char* tag, const TrackedBuff& t) {
 }
 TrackedBuff* FindTracked(void* buff, uint32_t uid) {
     for (auto& t : g_tracked)
-        if ((t.state == TRACK_NEW || t.state == TRACK_LIVE) && t.buff == buff && t.info.instance_uid == uid)
-            return &t;
+        if (t.state != TRACK_FREE && t.buff == buff && t.info.instance_uid == uid) return &t;
     return nullptr;
 }
-// Runs in the UI's buff callbacks; only touches the private table.
-void ProbeBuff(const char* via, ObjPtr ref, bool applied, int32_t reason) {
-    NoteThread(via);
-    void* buff = ref.object;
-    if (!buff || At<uint32_t>(buff, off.buffUid) != ref.uid) return; // stale head-bar replay
-    TrackedBuff* t = FindTracked(buff, ref.uid);
-    if (!applied) {
-        if (!t) return; // already finished through another panel
-        ReadTimers(*t);
-        t->state = TRACK_FINISHED;
-        t->frame = FrameNow();
-        t->reason = reason;
-        return;
-    }
-    if (t) return; // the same buff reported by another panel
-    for (auto& slot : g_tracked) if (slot.state == TRACK_FREE) { t = &slot; break; }
-    if (!t) {
-        if (ProbeLogAllowed()) LogF("[BUFF] table full, dropped uid=%u", ref.uid);
-        return;
-    }
-    *t = TrackedBuff{};
-    CaptureBuff(*t, buff, ref.uid, QpcNow());
-    t->state = TRACK_NEW;
-    t->frame = FrameNow();
-    t->reason = EFB_FINISH_LOST;
+int SlotOf(const TrackedBuff& t) { return int(&t - g_tracked); }
+uint32_t NextKey() {
+    if (!g_nextKey) g_nextKey = 1; // 0 marks an empty slot
+    return g_nextKey++;
 }
-// ---- Publishing (game thread, inside BeginWrite/EndWrite) ----
 bool SameBuff(const EFB_Buff& a, const EFB_Buff& b) {
     return a.owner.instance_uid == b.owner.instance_uid && a.source.instance_uid == b.source.instance_uid &&
         !strcmp(a.buff_id, b.buff_id);
 }
-int SlotOf(const TrackedBuff& t) { return int(&t - g_tracked); }
 const char* EventTag(int type) {
     switch (type) {
     case EFB_EVENT_BUFF_ADDED: return "+";
@@ -884,94 +920,25 @@ const char* EventTag(int type) {
     default: return "-";
     }
 }
-void PushEvent(int type, const TrackedBuff& t, int64_t now) {
+// Inside Write().
+void PushEvent(int type, const TrackedBuff& t, int64_t at, int32_t frame, int slot) {
     const uint64_t serial = ++g_view->event_head;
     EFB_Event& e = g_view->events[(serial - 1) % EFB_MAX_EVENTS];
+    e = EFB_Event{};
     e.serial = serial;
     e.type = type;
     e.finish_reason = type == EFB_EVENT_BUFF_FINISHED ? t.reason : 0;
     e.key = t.info.key;
-    e.buff_slot = SlotOf(t);
+    e.buff_slot = slot;
     e.owner_uid = t.info.owner.instance_uid;
     e.enhance_cnt = t.info.enhance_cnt;
-    e.at = now;
+    e.frame = frame;
+    e.at = at;
     memcpy(e.buff_id, t.info.buff_id, sizeof(e.buff_id));
-    LogBuff(EventTag(type), t);
+    LogBuff(EventTag(type), t, frame);
 }
-// Settles every add/finish from frames before the current one.
-void FlushTracked(int32_t frame, int64_t now) {
-    for (auto& n : g_tracked) {
-        if (n.state != TRACK_NEW || n.frame == frame) continue;
-        TrackedBuff* old = nullptr;
-        for (auto& e : g_tracked)
-            if (e.state == TRACK_FINISHED && e.info.key && e.frame == n.frame && SameBuff(e.info, n.info)) {
-                old = &e;
-                break;
-            }
-        n.state = TRACK_LIVE;
-        if (old) {
-            n.info.key = old->info.key;
-            n.info.added_at = old->info.added_at;
-            n.info.refreshed_at = now;
-            *old = TrackedBuff{};
-            PushEvent(EFB_EVENT_BUFF_REFRESHED, n, now);
-        } else {
-            if (!g_nextKey) g_nextKey = 1; // 0 marks an empty slot
-            n.info.key = g_nextKey++;
-            n.info.added_at = n.info.refreshed_at = now;
-            PushEvent(EFB_EVENT_BUFF_ADDED, n, now);
-        }
-    }
-    for (auto& e : g_tracked) {
-        if (e.state != TRACK_FINISHED || e.frame == frame) continue;
-        if (e.info.key) PushEvent(EFB_EVENT_BUFF_FINISHED, e, now);
-        else LogBuff("!", e); // added and finished within one frame: never published
-        e = TrackedBuff{};
-    }
-}
-// False once the buff is gone without a finish event.
-bool SampleTracked(TrackedBuff& t, int64_t now) {
-    __try {
-        const float passed = t.info.passed_time;
-        const int64_t at = t.info.sampled_at;
-        if (!ReadTimers(t)) return false; // object reused
-        if (t.ownerAbility && At<uint32_t>(t.ownerAbility, off.asUid) != t.info.owner.instance_uid) return false;
-        const float wall = SecondsBetween(at, now);
-        if (wall >= 0.02f) {
-            float d = (t.info.passed_time - passed) / wall;
-            if (d < 0 || d > 1.5f) d = 1;   // restarted in place: no rate to measure yet
-            else if (d < 0.05f) d = 0;
-            else if (d > 0.95f && d < 1.05f) d = 1;
-            t.info.time_dilation = d;
-            t.info.sampled_at = now;
-        }
-        if (off.buffFinished < 0 || !At<bool>(t.buff, off.buffFinished)) { t.finishedSince = 0; return true; }
-        // A finished buff normally reports its finish within the frame; give it time.
-        if (!t.finishedSince) t.finishedSince = now;
-        return SecondsBetween(t.finishedSince, now) < 0.5f;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-void SampleBuffs(int32_t frame, int64_t now) {
-    for (auto& t : g_tracked) {
-        if (t.state != TRACK_LIVE) continue;
-        const float passed = t.info.passed_time, duration = t.info.duration;
-        const int32_t stacks = t.info.enhance_cnt;
-        if (!SampleTracked(t, now)) {
-            t.state = TRACK_FINISHED;
-            t.frame = frame;
-            t.reason = EFB_FINISH_LOST;
-            continue;
-        }
-        if (t.info.passed_time < passed - 0.05f || t.info.duration != duration) {
-            t.info.refreshed_at = now;
-            PushEvent(EFB_EVENT_BUFF_REFRESHED, t, now);
-        }
-        if (t.info.enhance_cnt != stacks) PushEvent(EFB_EVENT_BUFF_ENHANCED, t, now);
-    }
-}
-void Publish(int64_t now) {
+// Mirrors the private table into buffs[]. Inside Write().
+void MirrorBuffs() {
     uint32_t count = 0;
     for (int i = 0; i < EFB_MAX_BUFFS; ++i) {
         const TrackedBuff& t = g_tracked[i];
@@ -981,55 +948,202 @@ void Publish(int64_t now) {
             g_view->buffs[i] = t.info;
             ++count;
         } else if (g_view->buffs[i].key) {
-            g_view->buffs[i].key = 0;
+            g_view->buffs[i] = EFB_Buff{};
         }
     }
     g_view->buff_count = count;
-    g_view->team = g_team;
-    memcpy(g_view->operators, g_ops, sizeof(g_ops));
-    g_view->published_at = now;
 }
-int64_t g_publishedAt = 0;
-void Tick() {
-    const int64_t now = QpcNow();
-    if (!SampleDue(g_publishedAt, now)) return;
-    const int32_t frame = FrameNow();
-    BeginWrite();
-    __try {
-        FlushTracked(frame, now);
-        SampleBuffs(frame, now);
-        Publish(now);
-    } __finally {
-        EndWrite();
+// Settles every add/finish reported before `frame`. Inside Write().
+void SettleBuffs(int32_t frame) {
+    bool pending = false;
+    for (auto& n : g_tracked) {
+        if (n.state != TRACK_NEW) continue;
+        if (n.addFrame >= frame) { pending = true; continue; }
+        TrackedBuff* old = nullptr;
+        for (auto& e : g_tracked)
+            if (e.state == TRACK_FINISHED && e.info.key && e.finishFrame == n.addFrame && SameBuff(e.info, n.info)) {
+                old = &e;
+                break;
+            }
+        n.state = TRACK_LIVE;
+        if (old) {
+            n.info.key = old->info.key;
+            n.info.added_at = old->info.added_at;
+            n.info.refreshed_at = n.addAt;
+            RememberUid(old->info.instance_uid);
+            *old = TrackedBuff{};
+            PushEvent(EFB_EVENT_BUFF_REFRESHED, n, n.addAt, n.addFrame, SlotOf(n));
+        } else {
+            n.info.key = NextKey();
+            n.info.added_at = n.info.refreshed_at = n.addAt;
+            PushEvent(EFB_EVENT_BUFF_ADDED, n, n.addAt, n.addFrame, SlotOf(n));
+        }
     }
+    for (auto& e : g_tracked) {
+        if (e.state != TRACK_FINISHED) continue;
+        if (e.finishFrame >= frame) { pending = true; continue; }
+        if (!e.info.key) {
+            // Added and finished within one frame: never entered buffs[].
+            e.info.key = NextKey();
+            e.info.added_at = e.info.refreshed_at = e.addAt;
+            PushEvent(EFB_EVENT_BUFF_ADDED, e, e.addAt, e.addFrame, -1);
+            PushEvent(EFB_EVENT_BUFF_FINISHED, e, e.finishAt, e.finishFrame, -1);
+        } else {
+            PushEvent(EFB_EVENT_BUFF_FINISHED, e, e.finishAt, e.finishFrame, SlotOf(e));
+        }
+        RememberUid(e.info.instance_uid);
+        e = TrackedBuff{};
+    }
+    g_buffsDirty = pending;
+}
+// False once the buff is gone without a finish report.
+bool SampleTracked(TrackedBuff& t, int64_t now) {
+    __try {
+        if (!ReadTimers(t)) return false; // object reused
+        if (t.ownerAbility && At<uint32_t>(t.ownerAbility, off.asUid) != t.info.owner.instance_uid) return false;
+        if (off.buffFinished < 0 || !At<bool>(t.buff, off.buffFinished)) { t.finishedSince = 0; return true; }
+        // A finished buff normally reports its finish within the frame; give it time.
+        if (!t.finishedSince) t.finishedSince = now;
+        return SecondsBetween(t.finishedSince, now) < 0.5f;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+// Game seconds per real second, measured over at least 0.1 s.
+void UpdateDilation(TrackedBuff& t, int64_t now) {
+    if (!t.rateAt) { t.rateAt = now; t.ratePassed = t.info.passed_time; return; }
+    const float wall = SecondsBetween(t.rateAt, now);
+    if (wall < 0.1f) return;
+    float d = (t.info.passed_time - t.ratePassed) / wall;
+    if (d < 0.05f) d = 0;
+    else if (d > 0.95f && d < 1.05f) d = 1;
+    else if (d > 1.5f) d = 1; // hitch: keep the nominal rate
+    t.info.time_dilation = d;
+    t.rateAt = now;
+    t.ratePassed = t.info.passed_time;
+}
+// Re-read of every live buff, once per sample interval. Inside Write().
+void SampleBuffs(int32_t frame, int64_t now) {
+    for (auto& t : g_tracked) {
+        if (t.state != TRACK_LIVE) continue;
+        const float passed = t.info.passed_time, duration = t.info.duration;
+        const int32_t stacks = t.info.enhance_cnt;
+        if (!SampleTracked(t, now)) {
+            t.state = TRACK_FINISHED;
+            t.finishFrame = frame;
+            t.finishAt = now;
+            t.reason = EFB_FINISH_LOST;
+            g_buffsDirty = true;
+            continue;
+        }
+        t.info.sampled_at = now;
+        if (t.info.passed_time < passed - 0.05f || t.info.duration != duration) {
+            t.info.refreshed_at = now;
+            t.rateAt = now;
+            t.ratePassed = t.info.passed_time;
+            PushEvent(EFB_EVENT_BUFF_REFRESHED, t, now, frame, SlotOf(t));
+        } else {
+            UpdateDilation(t, now);
+        }
+        if (t.info.enhance_cnt != stacks) PushEvent(EFB_EVENT_BUFF_ENHANCED, t, now, frame, SlotOf(t));
+    }
+}
+// UI buff callbacks (game thread): record the change at the moment the game
+// reports it; settlement happens on the next frame.
+void ProbeBuff(const char* via, ObjPtr ref, bool applied, int32_t reason) {
+    NoteThread(via);
+    void* buff = ref.object;
+    if (!buff || At<uint32_t>(buff, off.buffUid) != ref.uid) return; // stale head-bar replay
+    const int32_t frame = FrameNow();
+    const int64_t now = QpcNow();
+    Write([&] {
+        if (g_buffsDirty && frame > g_settledFrame) {
+            SettleBuffs(frame);
+            g_settledFrame = frame;
+        }
+        TrackedBuff* t = FindTracked(buff, ref.uid);
+        if (!applied) {
+            if (!t) {
+                // A finish for a buff never seen added: tracking began after it.
+                if (!IsRecentUid(ref.uid)) g_view->flags |= EFB_FLAG_BUFFS_PARTIAL;
+                return;
+            }
+            if (t->state == TRACK_FINISHED) return; // another panel already reported it
+            ReadTimers(*t);
+            t->state = TRACK_FINISHED;
+            t->finishFrame = frame;
+            t->finishAt = now;
+            t->reason = reason;
+            g_buffsDirty = true;
+            return;
+        }
+        if (t) return; // the same buff reported by another panel
+        for (auto& slot : g_tracked) if (slot.state == TRACK_FREE) { t = &slot; break; }
+        if (!t) {
+            ++g_view->buffs_dropped;
+            g_view->flags |= EFB_FLAG_BUFFS_DROPPED;
+            RememberUid(ref.uid);
+            if (ProbeLogAllowed()) LogF("[BUFF] table full, dropped uid=%u", ref.uid);
+            return;
+        }
+        *t = TrackedBuff{};
+        CaptureBuff(*t, buff, ref.uid, now);
+        t->state = TRACK_NEW;
+        t->addFrame = frame;
+        t->addAt = now;
+        t->reason = EFB_FINISH_LOST;
+        g_buffsDirty = true;
+    });
+}
+// HUD LateTick hooks (game thread): once per frame.
+uint32_t g_sessionsStarted = 0;
+// Adds and finishes settle every frame; timers and stacks follow the interval.
+int64_t g_buffsSampledAt = 0;
+void Tick() {
+    const int32_t frame = FrameNow();
+    if (frame == g_tickedFrame) return;
+    g_tickedFrame = frame;
+    const int64_t now = QpcNow();
+    const bool settle = g_buffsDirty && frame > g_settledFrame;
+    const bool sample = SampleDue(g_buffsSampledAt, now);
+    if (!settle && !sample) return;
+    Write([&] {
+        if (settle) {
+            SettleBuffs(frame);
+            g_settledFrame = frame;
+        }
+        if (sample) SampleBuffs(frame, now);
+        g_view->sample_interval_ms = uint32_t(g_sampleIntervalMs.load());
+        MirrorBuffs();
+    });
 }
 // Worker thread, before probes open: a fresh session with empty tables.
 void StartSession() {
     for (auto& t : g_tracked) t = TrackedBuff{};
     for (auto& s : g_squad) s = SquadSlot{};
-    for (auto& o : g_ops) o = EFB_Operator{};
     for (auto& l : g_slotLog) l = SlotLog{};
     memset(g_opSampledAt, 0, sizeof(g_opSampledAt));
-    g_team = EFB_Team{};
-    g_teamSampledAt = g_publishedAt = 0;
+    memset(g_recentUids, 0, sizeof(g_recentUids));
+    g_teamSampledAt = g_buffsSampledAt = 0;
+    g_buffsDirty = false;
+    g_settledFrame = g_tickedFrame = INT32_MIN;
     g_uiThread = 0;
-    BeginWrite();
-    ++g_view->session;
-    g_view->team = g_team;
-    memset(g_view->operators, 0, sizeof(g_view->operators));
-    memset(g_view->buffs, 0, sizeof(g_view->buffs));
-    g_view->buff_count = 0;
-    g_view->published_at = QpcNow();
-    g_view->active = 1;
-    EndWrite();
+    Write([&] {
+        ++g_view->session;
+        g_view->session_started_at = QpcNow();
+        g_view->team = EFB_Team{};
+        memset(g_view->operators, 0, sizeof(g_view->operators));
+        memset(g_view->buffs, 0, sizeof(g_view->buffs));
+        g_view->buff_count = g_view->valid_mask = g_view->buffs_dropped = 0;
+        // A re-enable starts in the middle of the game.
+        g_view->flags = g_sessionsStarted++ ? EFB_FLAG_BUFFS_PARTIAL : 0;
+        g_view->active = 1;
+    });
     LogF("[SHM] session %u started", g_view->session);
 }
 // Restore: probes are drained, so no game-thread write is in flight.
 void EndSession() {
-    if (!g_view) return;
-    BeginWrite();
-    g_view->active = 0;
-    EndWrite();
+    if (g_view) Write([] { g_view->active = 0; });
 }
 template<class Fn> void Guarded(Fn fn) {
     __try { fn(); }
@@ -1291,6 +1405,76 @@ APH_Result APH_CALL Restore(APH_Owner owner, const APH_Cleanup* cleanup, void*) 
     if (r == APH_OK) Log("restored", 0, APH_OK);
     return r;
 }
+// ============================================================================
+// Basic settings (Manager: plugin\config\applepie.endfield.data_bridge.ini)
+// ============================================================================
+APH_ConfigApi g_configApi{};
+bool g_logOpenedOnce = false;
+// Opens or closes plugin\EndfieldDataBridge_log.txt. Notifier or Attach thread.
+void SetDebug(bool on) {
+    AcquireSRWLockExclusive(&g_logLock);
+    if (on && g_logFile == INVALID_HANDLE_VALUE && g_pluginDir[0]) {
+        wchar_t path[MAX_PATH]{};
+        swprintf_s(path, L"%ls\\EndfieldDataBridge_log.txt", g_pluginDir);
+        // A new process starts a fresh log; toggling within a process appends.
+        g_logFile = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr,
+            g_logOpenedOnce ? OPEN_ALWAYS : CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        g_logOpenedOnce = g_logOpenedOnce || g_logFile != INVALID_HANDLE_VALUE;
+    } else if (!on && g_logFile != INVALID_HANDLE_VALUE) {
+        CloseHandle(g_logFile);
+        g_logFile = INVALID_HANDLE_VALUE;
+    }
+    g_debug = on && g_logFile != INVALID_HANDLE_VALUE;
+    ReleaseSRWLockExclusive(&g_logLock);
+}
+const APH_ConfigOption kIntervals[]{{"50ms"}, {"100ms"}, {"150ms"}, {"200ms"}};
+constexpr uint32_t CONFIG_FIELDS = 2; // debug, sample_interval
+APH_Result SyncConfig() {
+    APH_ConfigSnapshot state{};
+    APH_ConfigValue values[CONFIG_FIELDS]{};
+    const APH_Result r = g_configApi.snapshot(g_client.owner(), sizeof(state), &state, CONFIG_FIELDS, values);
+    if (r != APH_OK) return r;
+    const bool on = values[0].integer != 0;
+    if (on != g_debug.load()) {
+        if (!on) LogF("debug log off");
+        SetDebug(on);
+        if (on) LogF("debug log on");
+    }
+    // "50ms" .. "200ms"; the host only stores listed options.
+    const int interval = atoi(values[1].text);
+    if (interval >= 50 && interval <= 200 && interval != g_sampleIntervalMs.exchange(interval))
+        LogF("sample interval %d ms", interval);
+    return APH_OK;
+}
+void APH_CALL ConfigChanged(APH_Owner, void*) { SyncConfig(); }
+// Optional: an older Manager without basic settings simply leaves debug off.
+APH_Result RegisterConfig() {
+    APH_Result r = g_client.Service(g_configApi);
+    if (r != APH_OK || !g_configApi.register_schema || !g_configApi.snapshot) return APH_E_UNAVAILABLE;
+    APH_ConfigField fields[CONFIG_FIELDS]{};
+    for (auto& f : fields) f.size = sizeof(f);
+    fields[0].type = fields[0].initial.type = APH_CONFIG_BOOL;
+    strcpy_s(fields[0].key, "debug");
+    strcpy_s(fields[0].label, "Debug log / 调试日志");
+    strcpy_s(fields[0].description,
+        "Write plugin\\EndfieldDataBridge_log.txt / 输出 plugin\\EndfieldDataBridge_log.txt");
+    fields[1].type = fields[1].initial.type = APH_CONFIG_ENUM;
+    strcpy_s(fields[1].key, "sample_interval");
+    strcpy_s(fields[1].label, "Sample interval / 采样频率");
+    strcpy_s(fields[1].description,
+        "How often SP, operators and buff timers are read / 技力、干员和 Buff 计时的读取间隔");
+    fields[1].options = kIntervals;
+    fields[1].option_count = 4;
+    strcpy_s(fields[1].initial.text, "50ms");
+    const APH_ConfigSchema schema{sizeof(schema), CONFIG_FIELDS, fields};
+    r = g_configApi.register_schema(g_client.owner(), &schema);
+    if (r != APH_OK) return r;
+    if (g_configApi.set_notifier) {
+        r = g_configApi.set_notifier(g_client.owner(), ConfigChanged, nullptr);
+        if (r != APH_OK) return r;
+    }
+    return SyncConfig();
+}
 } // namespace
 
 extern "C" __declspec(dllexport) const APH_Manifest APH_PluginManifest = {
@@ -1319,22 +1503,17 @@ extern "C" __declspec(dllexport) APH_Result APH_CALL APH_Attach(
     if (wchar_t* slash = length && length < MAX_PATH ? wcsrchr(g_pluginDir, L'\\') : nullptr)
         *slash = 0;
     else g_pluginDir[0] = 0;
-    if (g_pluginDir[0]) {
-        wchar_t path[MAX_PATH]{};
-        swprintf_s(path, L"%ls\\EndfieldDataBridge_debug.txt", g_pluginDir);
-        g_debug = GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
-        swprintf_s(path, L"%ls\\EndfieldDataBridge_log.txt", g_pluginDir);
-        g_logFile = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr,
-            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    }
 
     const APH_LifecycleDesc lifecycle{
         sizeof(APH_LifecycleDesc), 10000, Disabling, Restore, nullptr
     };
     const APH_Result result = g_client.RegisterLifecycle(lifecycle);
-    LogF("attached owner=%llu result=%ld debug=%d", static_cast<unsigned long long>(g_client.owner()),
-        static_cast<long>(result), int(g_debug));
-    return result;
+    if (result != APH_OK) return result;
+    // Settings are optional: without them (older Manager, unreadable file) debug stays off.
+    const APH_Result config = RegisterConfig();
+    LogF("attached owner=%llu config=%ld debug=%d", static_cast<unsigned long long>(g_client.owner()),
+        static_cast<long>(config), int(g_debug.load()));
+    return APH_OK;
 }
 
 extern "C" __declspec(dllexport) APH_Result APH_CALL APH_Enable(

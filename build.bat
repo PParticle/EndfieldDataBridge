@@ -63,6 +63,13 @@ cl /nologo /utf-8 /O2 /MT /EHsc /std:c++17 /W4 /wd4505 ^
     /link /INCREMENTAL:NO /MACHINE:X64 /LTCG
 if errorlevel 1 exit /b 1
 bin\bridge_verify.exe
+if errorlevel 1 exit /b 1
+cl /nologo /utf-8 /O2 /MT /EHsc /std:c++17 /W4 /permissive- /wd4505 ^
+    /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I"%APPLEPIE_DIR%\sdk" ^
+    tests\data_test.cpp /Fo:bin\data_test.obj /Fe:bin\data_test.exe ^
+    /link /INCREMENTAL:NO /MACHINE:X64
+if errorlevel 1 exit /b 1
+bin\data_test.exe
 exit /b %ERRORLEVEL%
 
 :usage
