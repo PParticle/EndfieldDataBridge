@@ -486,6 +486,174 @@ void TestCompatibility() {
     CHECK(efb::ReadHeader(m, rh) == efb::Result::Incompatible);
     std::puts("[OK] Reader handles newer and older minor layouts; rejects other ABIs");
 }
+// ---- Units and skill casts ----
+// Fake AbilitySystem fields behind fake getters (MethodInfo: function pointer first).
+constexpr size_t kFaction = 0x14, kHp = 0x18, kMaxHp = 0x20, kPoise = 0x28, kMaxPoise = 0x2C, kHasPoise = 0x30,
+    kZeroPoise = 0x31, kInRecovery = 0x32, kProgress = 0x34, kRecTime = 0x38, kSumRecTime = 0x3C;
+template<class T, size_t Offset> T FakeGetter(void* self, void*) { return At<T>(self, int(Offset)); }
+struct FakeMethod { void* fn; };
+FakeMethod g_fakeFaction{reinterpret_cast<void*>(&FakeGetter<int32_t, kFaction>)};
+FakeMethod g_fakeHp{reinterpret_cast<void*>(&FakeGetter<double, kHp>)};
+FakeMethod g_fakeMaxHp{reinterpret_cast<void*>(&FakeGetter<double, kMaxHp>)};
+FakeMethod g_fakePoise{reinterpret_cast<void*>(&FakeGetter<float, kPoise>)};
+FakeMethod g_fakeMaxPoise{reinterpret_cast<void*>(&FakeGetter<float, kMaxPoise>)};
+FakeMethod g_fakeHasPoise{reinterpret_cast<void*>(&FakeGetter<bool, kHasPoise>)};
+FakeMethod g_fakeZeroPoise{reinterpret_cast<void*>(&FakeGetter<bool, kZeroPoise>)};
+FakeMethod g_fakeInRecovery{reinterpret_cast<void*>(&FakeGetter<bool, kInRecovery>)};
+FakeMethod g_fakeProgress{reinterpret_cast<void*>(&FakeGetter<float, kProgress>)};
+FakeMethod g_fakeRecTime{reinterpret_cast<void*>(&FakeGetter<float, kRecTime>)};
+FakeMethod g_fakeSumRecTime{reinterpret_cast<void*>(&FakeGetter<float, kSumRecTime>)};
+// Fake Skill: type 0x10, owner 0x18 (ObjectPtr), id 0x28, casting 0x30, castId 0x34, instId 0x38.
+FakeMethod g_fakeIsCasting{reinterpret_cast<void*>(&FakeGetter<bool, 0x30>)};
+FakeMethod g_fakeCastId{reinterpret_cast<void*>(&FakeGetter<uint32_t, 0x34>)};
+FakeMethod g_fakeInstId{reinterpret_cast<void*>(&FakeGetter<uint64_t, 0x38>)};
+struct FakeUnit { alignas(8) char bytes[0x40]{}; };
+struct FakeSkill { alignas(8) char bytes[0x40]{}; FakeString id; };
+void SetUpUnitGetters() {
+    g_mFaction = &g_fakeFaction;
+    g_mHp = &g_fakeHp; g_mMaxHp = &g_fakeMaxHp; g_mPoise = &g_fakePoise; g_mMaxPoise = &g_fakeMaxPoise;
+    g_mHasPoise = &g_fakeHasPoise; g_mZeroPoise = &g_fakeZeroPoise; g_mInPoiseRecovery = &g_fakeInRecovery;
+    g_mPoiseProgress = &g_fakeProgress; g_mPoiseRecTime = &g_fakeRecTime; g_mSumPoiseRecTime = &g_fakeSumRecTime;
+    g_mIsCasting = &g_fakeIsCasting; g_mSkillCastId = &g_fakeCastId; g_mSkillInstId = &g_fakeInstId;
+    off.skillType = 0x10; off.skillOwner = 0x18; off.skillId = 0x28;
+    off.sqIndex = 0x10; off.sqAbility = 0x18; off.sqEmpty = 0x28; off.sqMain = 0x29;
+    off.hbTarget = 0x10;
+}
+void MakeUnit(FakeUnit& u, uint32_t uid, int32_t faction, double hp, double maxHp, float poise, float maxPoise) {
+    memset(u.bytes, 0, sizeof(u.bytes));
+    Put<uint32_t>(u.bytes, off.asUid, uid);
+    Put<int32_t>(u.bytes, kFaction, faction);
+    Put<double>(u.bytes, kHp, hp);
+    Put<double>(u.bytes, kMaxHp, maxHp);
+    Put<float>(u.bytes, kPoise, poise);
+    Put<float>(u.bytes, kMaxPoise, maxPoise);
+    Put<bool>(u.bytes, kHasPoise, maxPoise > 0);
+}
+std::vector<EFB_UnitState> Units() {
+    for (;;) {
+        efb::Header h;
+        efb::Section s;
+        CHECK(efb::ReadHeader(g_reader, h) == efb::Result::Ok);
+        const efb::Result r = efb::ReadSection(g_reader, h, EFB_SECTION_UNITS, s);
+        if (r == efb::Result::Retry) continue;
+        CHECK(r == efb::Result::Ok && s.Head<EFB_UnitsHeader>().count <= s.capacity());
+        std::vector<EFB_UnitState> out;
+        for (uint32_t i = 0; i < s.capacity(); ++i) {
+            const EFB_UnitState u = s.Element<EFB_UnitState>(i);
+            if (u.instance_uid) out.push_back(u);
+        }
+        CHECK(out.size() == s.Head<EFB_UnitsHeader>().count);
+        return out;
+    }
+}
+const EFB_UnitState* FindUnit(const std::vector<EFB_UnitState>& units, uint32_t uid) {
+    for (const auto& u : units) if (u.instance_uid == uid) return &u;
+    return nullptr;
+}
+
+void TestUnits() {
+    Reset();
+    FakeUnit ikut{}, boss{};
+    MakeUnit(ikut, 11, EFB_FACTION_GOOD, 900, 1000, 0, 0);
+    MakeUnit(boss, 77, EFB_FACTION_BAD, 50000, 60000, 40, 100);
+    alignas(8) char icon[0x30]{}, bar[0x20]{};
+    Put<int32_t>(icon, off.sqIndex, 2);
+    Put<ObjPtr>(icon, off.sqAbility, ObjPtr{ikut.bytes, 11, 0});
+    Put<ObjPtr>(bar, off.hbTarget, ObjPtr{boss.bytes, 77, 0});
+    ProbeSquad(icon);
+    ProbeHeadBar(bar);
+    NextFrame();
+    auto units = Units();
+    CHECK(units.size() == 2);
+    const EFB_UnitState* a = FindUnit(units, 11);
+    const EFB_UnitState* b = FindUnit(units, 77);
+    CHECK(a && a->char_index == 2 && !a->on_head_bar && a->hp == 900 && a->max_hp == 1000 && !a->has_poise &&
+        a->faction == EFB_FACTION_GOOD && a->sampled_at);
+    CHECK(b && b->char_index == -1 && b->on_head_bar && b->hp == 50000 && b->max_hp == 60000 && b->has_poise &&
+        b->poise == 40 && b->max_poise == 100 && b->faction == EFB_FACTION_BAD);
+
+    // Broken, then recovering: raw fields as the game reports them.
+    Put<float>(boss.bytes, kPoise, 0);
+    Put<bool>(boss.bytes, kZeroPoise, true);
+    Put<bool>(boss.bytes, kInRecovery, true);
+    Put<float>(boss.bytes, kProgress, 0.25f);
+    Put<float>(boss.bytes, kRecTime, 1.5f);
+    Put<float>(boss.bytes, kSumRecTime, 6.0f);
+    Put<double>(boss.bytes, kHp, 42000);
+    ProbeHeadBar(bar);
+    NextFrame();
+    b = FindUnit(units = Units(), 77);
+    CHECK(b && b->is_zero_poise && b->in_poise_recovery && b->poise_recovery_progress == 0.25f &&
+        b->poise_rec_time == 1.5f && b->sum_poise_rec_time == 6.0f && b->hp == 42000);
+
+    // The head bar goes away: the unit stays a short while, then leaves; the squad member stays.
+    for (int i = 0; i < 30; ++i) { ProbeSquad(icon); NextFrame(); }
+    CHECK(FindUnit(Units(), 77));
+    for (int i = 0; i < 40; ++i) { ProbeSquad(icon); NextFrame(); }
+    units = Units();
+    CHECK(!FindUnit(units, 77) && FindUnit(units, 11));
+    // The object is reused for another unit: the old one leaves at once.
+    ProbeHeadBar(bar);
+    NextFrame();
+    CHECK(FindUnit(Units(), 77));
+    Put<uint32_t>(boss.bytes, off.asUid, 78);
+    NextFrame();
+    CHECK(!FindUnit(Units(), 77));
+    // A new session starts empty.
+    Reset();
+    CHECK(Units().empty());
+    std::puts("[OK] Units: squad and head-bar units with HP and poise, removal when gone");
+}
+
+void TestSkillCasts() {
+    Reset();
+    g_provides = EFB_PROVIDES_SKILL_CASTS;
+    FakeUnit enemy{};
+    MakeUnit(enemy, 77, EFB_FACTION_BAD, 100, 100, 0, 0);
+    FakeSkill attack{}, ult{};
+    auto make = [](FakeSkill& s, int32_t type, FakeUnit& owner, uint32_t ownerUid, const char* id, uint32_t castId) {
+        memset(s.bytes, 0, sizeof(s.bytes));
+        SetString(s.id, id);
+        Put<int32_t>(s.bytes, off.skillType, type);
+        Put<ObjPtr>(s.bytes, off.skillOwner, ObjPtr{owner.bytes, ownerUid, 0});
+        Put<void*>(s.bytes, off.skillId, &s.id);
+        Put<uint32_t>(s.bytes, 0x34, castId);
+        Put<uint64_t>(s.bytes, 0x38, 9000 + castId);
+    };
+    make(attack, EFB_SKILL_ATTACK, enemy, 77, "eny_attack", 1);
+    make(ult, EFB_SKILL_ULTIMATE, enemy, 77, "eny_ultimate", 2);
+    // Normal attacks are not reported.
+    Put<bool>(attack.bytes, 0x30, true);
+    ProbeCastStart(attack.bytes);
+    ProbeCastEnd(attack.bytes, 0, 0);
+    CHECK(NewEvents().empty());
+    // DoCast that did not start casting reports nothing.
+    ProbeCastStart(ult.bytes);
+    CHECK(NewEvents().empty());
+    Put<bool>(ult.bytes, 0x30, true);
+    ProbeCastStart(ult.bytes);
+    ProbeCastEnd(ult.bytes, 3, 5);
+    Put<bool>(ult.bytes, 0x30, false);
+    ProbeCastEnd(ult.bytes, 3, 5); // a second end after the cast finished
+    efb::Header h;
+    CHECK(efb::ReadHeader(g_reader, h) == efb::Result::Ok);
+    efb::EventBatch batch;
+    CHECK(g_cursor.Poll(g_reader, h, batch) == efb::Result::Ok && batch.events.size() == 2);
+    const auto s0 = efb::Payload<EFB_SkillEventPayload>(batch.events[0]);
+    const auto s1 = efb::Payload<EFB_SkillEventPayload>(batch.events[1]);
+    CHECK(batch.events[0].type == EFB_EVENT_SKILL_CAST_STARTED && batch.events[1].type == EFB_EVENT_SKILL_CAST_ENDED);
+    CHECK(batch.events[0].subject_uid == 77 && s0.caster_uid == 77 && s0.char_index == -1 && s0.faction == EFB_FACTION_BAD &&
+        s0.skill_type == EFB_SKILL_ULTIMATE && s0.skill_cast_id == 2 && s0.skill_inst_id == 9002 &&
+        !strcmp(s0.skill_id, "eny_ultimate"));
+    CHECK(s1.skill_cast_id == s0.skill_cast_id && s1.finish_type == 3 && s1.interrupt_reason == 5);
+    // Not installed: nothing.
+    g_provides = 0;
+    Put<bool>(ult.bytes, 0x30, true);
+    ProbeCastStart(ult.bytes);
+    CHECK(NewEvents().empty());
+    std::puts("[OK] Skill casts: start/end paired by cast id, normal attacks and non-starts not reported");
+}
+
 // A reader thread, via the reference reader, while the game thread writes:
 //  - a buffs copy is never torn: every live entry has enhance_cnt == count;
 //  - events never run ahead of buffs: a key the events say is present is in
@@ -594,6 +762,9 @@ int main() {
     TestSampleInterval();
     TestSectionIndependence();
     TestCompatibility();
+    SetUpUnitGetters();
+    TestUnits();
+    TestSkillCasts();
     TestConcurrentReader();
     std::puts("[PASS] EndfieldDataBridge offline data verification");
     return 0;

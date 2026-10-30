@@ -1,4 +1,4 @@
-// EndfieldDataBridge shared memory (read-only for consumers), ABI 1.0.
+// EndfieldDataBridge shared memory (read-only for consumers), ABI 1.1.
 // include/endfield_bridge_reader.h implements every rule below.
 //
 // Mapping: EFB_MAPPING_NAME, EFB_MAPPING_SIZE bytes reserved, total_size used.
@@ -47,6 +47,15 @@
 //   elapsed   = min(seconds since sampled_at, 0.25)
 //   life_left = max(life_time - elapsed * time_dilation, 0)
 //
+// Units: the squad and every unit that has an enemy head bar, one element per
+// unit (skip instance_uid == 0), keyed by the same instance_uid as buff owners
+// and sources. A unit leaves when its head bar has not updated for a while
+// or the game object goes away.
+//
+// Skill casts: start and end of squad and enemy skills, excluding normal
+// attacks (SkillType Attack / BreakingAttack) and dodges. A cast's end is not
+// the end of its effect: a transformation or lasting effect ends with its buff.
+//
 // Buffs: buffs reported by the squad portraits and enemy head bars. A buff
 // keeps its `key` across refreshes within a session; EFB_BuffsHeader.flags
 // says when the table may be incomplete.
@@ -69,7 +78,7 @@
 #define EFB_MAPPING_SIZE (1u << 20)
 #define EFB_MAGIC 0x44424645u /* "EFBD" */
 #define EFB_ABI_MAJOR 1u
-#define EFB_ABI_MINOR 0u
+#define EFB_ABI_MINOR 1u
 #define EFB_NAME_LEN 64
 #define EFB_ID_LEN 96
 #define EFB_EVENT_PAYLOAD 128
@@ -79,7 +88,15 @@ enum EFB_SectionId {
     EFB_SECTION_OPERATORS = 2, // EFB_SectionHeader, EFB_Operator per squad slot (index = char_index)
     EFB_SECTION_BUFFS = 3,     // EFB_BuffsHeader, EFB_Buff slots (skip key == 0)
     EFB_SECTION_EVENTS = 4,    // EFB_EventsHeader, EFB_Event ring
+    EFB_SECTION_UNITS = 5,     // EFB_UnitsHeader, EFB_UnitState slots; since 1.1
 };
+// EFB_Header.provides: optional data this writer could hook (since 1.1)
+#define EFB_PROVIDES_HEAD_BAR_UNITS 0x1u /* enemy head bar units in the units section */
+#define EFB_PROVIDES_SKILL_CASTS 0x2u    /* EFB_EVENT_SKILL_CAST_* events */
+// Beyond.Gameplay.SkillType
+enum EFB_SkillType { EFB_SKILL_PASSIVE = -1, EFB_SKILL_ATTACK = 0, EFB_SKILL_BREAKING_ATTACK = 1,
+    EFB_SKILL_NORMAL = 2, EFB_SKILL_ATTACH = 3, EFB_SKILL_DODGE = 5, EFB_SKILL_COMBO = 6,
+    EFB_SKILL_ULTIMATE = 7, EFB_SKILL_EXTRA_ACTIVE = 8 };
 // Beyond.Gameplay.Core.FactionIndex
 enum EFB_Faction { EFB_FACTION_INVALID = 0, EFB_FACTION_UNKNOWN = 1, EFB_FACTION_GOOD = 2,
     EFB_FACTION_BAD = 3, EFB_FACTION_NEUTRAL = 4 };
@@ -89,12 +106,14 @@ enum EFB_LifeType { EFB_LIFE_LIMITED = 0, EFB_LIFE_INFINITY = 1 };
 enum EFB_FinishReason { EFB_FINISH_LIFETIME = 0, EFB_FINISH_IGNITE = 1, EFB_FINISH_EARLY = 2,
     EFB_FINISH_DISPELLED = 3, EFB_FINISH_ABSORBED = 4, EFB_FINISH_OTHER = 100,
     EFB_FINISH_LOST = -1 /* vanished without a finish event (owner gone, object reused) */ };
-// EFB_Event.type; all four carry EFB_BuffEventPayload.
+// EFB_Event.type
 enum EFB_EventType {
-    EFB_EVENT_BUFF_ADDED = 1,     // new key in the buff table
+    EFB_EVENT_BUFF_ADDED = 1,     // EFB_BuffEventPayload: new key in the buff table
     EFB_EVENT_BUFF_REFRESHED = 2, // timer restarted or duration changed; key unchanged
     EFB_EVENT_BUFF_ENHANCED = 3,  // enhance_cnt (stacks) changed
     EFB_EVENT_BUFF_FINISHED = 4,  // key left the table; finish_reason says why
+    EFB_EVENT_SKILL_CAST_STARTED = 16, // EFB_SkillEventPayload; since 1.1
+    EFB_EVENT_SKILL_CAST_ENDED = 17,   // EFB_SkillEventPayload; since 1.1
 };
 // EFB_BuffsHeader.flags
 #define EFB_BUFFS_PARTIAL 0x1u /* tracking began mid-game: buffs added before may be missing */
@@ -115,7 +134,7 @@ typedef struct EFB_Header {
     uint32_t active;           // 0 while the plugin is disabled; stays 1 if the game crashes
     uint32_t writer_pid;
     uint32_t sample_interval_ms; // Manager setting
-    uint32_t reserved;
+    uint32_t provides;         // EFB_PROVIDES_*; since 1.1
     uint64_t writer_start_time; // writer process creation time (FILETIME as uint64)
     int64_t qpc_frequency;
     int64_t session_started_at;
@@ -143,6 +162,12 @@ typedef struct EFB_BuffsHeader {
     uint32_t dropped;          // buffs never tracked this session
     uint32_t reserved;
 } EFB_BuffsHeader;
+
+typedef struct EFB_UnitsHeader {  // since 1.1
+    EFB_SectionHeader common;
+    uint32_t count;            // live entries
+    uint32_t reserved;
+} EFB_UnitsHeader;
 
 typedef struct EFB_EventsHeader {
     EFB_SectionHeader common;
@@ -205,6 +230,27 @@ typedef struct EFB_Buff {
     int64_t sampled_at;        // when life_time/passed_time were read
 } EFB_Buff;
 
+// HP and poise (失衡) of one unit, from its AbilitySystem. Since 1.1.
+typedef struct EFB_UnitState {
+    uint32_t instance_uid;     // 0 = empty slot
+    int8_t char_index;         // squad slot 0-3, -1 = not in the squad
+    int8_t faction;            // EFB_Faction, -1 = unknown
+    uint8_t on_head_bar;       // shown by an enemy head bar
+    uint8_t has_poise;         // the unit has a poise bar at all
+    char entity_name[EFB_NAME_LEN];
+    double hp;
+    double max_hp;
+    float poise;               // AbilitySystem.poise
+    float max_poise;           // AbilitySystem.maxPoise
+    uint8_t is_zero_poise;     // poise exhausted: the unit is broken (失衡)
+    uint8_t in_poise_recovery; // recovering from a break
+    uint8_t reserved[2];
+    float poise_recovery_progress; // AbilitySystem.poiseRecoveryProgress, as the game reports it
+    float poise_rec_time;      // AbilitySystem.poiseRecTime (seconds)
+    float sum_poise_rec_time;  // AbilitySystem.sumPoiseRecTime (seconds)
+    int64_t sampled_at;
+} EFB_UnitState;
+
 typedef struct EFB_Event {
     uint64_t serial;           // 1-based
     uint32_t type;             // EFB_EventType
@@ -224,6 +270,19 @@ typedef struct EFB_BuffEventPayload {
     uint32_t reserved;
     char buff_id[EFB_ID_LEN];
 } EFB_BuffEventPayload;
+// Start and end of one cast. Since 1.1.
+typedef struct EFB_SkillEventPayload {
+    uint32_t caster_uid;       // AbilitySystem.instance_uid, as EFB_Event.subject_uid
+    int8_t char_index;         // squad slot 0-3, -1 = enemy or other
+    int8_t faction;            // EFB_Faction, -1 = unknown
+    uint16_t reserved;
+    int32_t skill_type;        // EFB_SkillType
+    uint32_t skill_cast_id;    // Skill.skillCastId: pairs STARTED with ENDED
+    uint64_t skill_inst_id;    // Skill.instId
+    int32_t finish_type;       // ENDED only: Beyond.Gameplay.Core.Skill.FinishType
+    int32_t interrupt_reason;  // ENDED only: Beyond.Gameplay.Core.Skill.InterruptReason
+    char skill_id[EFB_ID_LEN];
+} EFB_SkillEventPayload;
 #pragma pack(pop)
 
 #ifdef __cplusplus
@@ -232,6 +291,9 @@ static_assert(sizeof(EFB_Section) == 24, "EFB_Section layout");
 static_assert(sizeof(EFB_SectionHeader) == 16, "EFB_SectionHeader layout");
 static_assert(sizeof(EFB_BuffsHeader) == 32, "EFB_BuffsHeader layout");
 static_assert(sizeof(EFB_EventsHeader) == 24, "EFB_EventsHeader layout");
+static_assert(sizeof(EFB_UnitsHeader) == 24, "EFB_UnitsHeader layout");
+static_assert(sizeof(EFB_UnitState) == 120, "EFB_UnitState layout");
+static_assert(sizeof(EFB_SkillEventPayload) <= EFB_EVENT_PAYLOAD, "EFB_SkillEventPayload fits");
 static_assert(sizeof(EFB_Unit) == 72, "EFB_Unit layout");
 static_assert(sizeof(EFB_Team) == 24, "EFB_Team layout");
 static_assert(sizeof(EFB_Operator) == 96, "EFB_Operator layout");

@@ -28,6 +28,8 @@ const char* EventName(uint32_t type) {
     case EFB_EVENT_BUFF_REFRESHED: return "REFRESHED";
     case EFB_EVENT_BUFF_ENHANCED: return "ENHANCED";
     case EFB_EVENT_BUFF_FINISHED: return "FINISHED";
+    case EFB_EVENT_SKILL_CAST_STARTED: return "CAST+";
+    case EFB_EVENT_SKILL_CAST_ENDED: return "CAST-";
     default: return nullptr;
     }
 }
@@ -39,15 +41,23 @@ struct State {
     std::vector<EFB_Operator> ops;
     EFB_BuffsHeader buffsHead{};
     std::vector<EFB_Buff> buffs;
+    std::vector<EFB_UnitState> units; // empty when the writer has no units section
 };
 bool Read(State& st) {
     for (int attempt = 0; attempt < 100; ++attempt) {
         if (efb::ReadHeader(g_map, st.header) != efb::Result::Ok) { Sleep(1); continue; }
-        efb::Section team, ops, buffs;
+        efb::Section team, ops, buffs, units;
         if (efb::ReadSection(g_map, st.header, EFB_SECTION_TEAM, team) != efb::Result::Ok ||
             efb::ReadSection(g_map, st.header, EFB_SECTION_OPERATORS, ops) != efb::Result::Ok ||
             efb::ReadSection(g_map, st.header, EFB_SECTION_BUFFS, buffs) != efb::Result::Ok)
             continue;
+        const efb::Result ru = efb::ReadSection(g_map, st.header, EFB_SECTION_UNITS, units);
+        if (ru != efb::Result::Ok && ru != efb::Result::Missing) continue;
+        st.units.clear();
+        for (uint32_t i = 0; ru == efb::Result::Ok && i < units.capacity(); ++i) {
+            const EFB_UnitState u = units.Element<EFB_UnitState>(i);
+            if (u.instance_uid) st.units.push_back(u);
+        }
         st.team = team.capacity() ? team.Element<EFB_Team>(0) : EFB_Team{};
         st.ops.clear();
         for (uint32_t i = 0; i < ops.capacity(); ++i) st.ops.push_back(ops.Element<EFB_Operator>(i));
@@ -71,9 +81,11 @@ void Print(const State& st) {
     std::string flags;
     if (st.buffsHead.flags & EFB_BUFFS_PARTIAL) flags += " PARTIAL";
     if (st.buffsHead.flags & EFB_BUFFS_DROPPED) flags += " DROPPED(" + std::to_string(st.buffsHead.dropped) + ")";
-    std::printf("[%s] ABI %u.%u session=%u pid=%u interval=%ums buffs=%u flags:%s\n\n", efb::StatusName(status),
-        h.abi_major, h.abi_minor, h.session, h.writer_pid, h.sample_interval_ms, st.buffsHead.count,
-        flags.empty() ? " -" : flags.c_str());
+    if (!(h.provides & EFB_PROVIDES_HEAD_BAR_UNITS)) flags += " NO_HEAD_BAR_UNITS";
+    if (!(h.provides & EFB_PROVIDES_SKILL_CASTS)) flags += " NO_SKILL_CASTS";
+    std::printf("[%s] ABI %u.%u session=%u pid=%u interval=%ums buffs=%u units=%zu flags:%s\n\n",
+        efb::StatusName(status), h.abi_major, h.abi_minor, h.session, h.writer_pid, h.sample_interval_ms,
+        st.buffsHead.count, st.units.size(), flags.empty() ? " -" : flags.c_str());
     if (status == efb::Status::WriterGone || status == efb::Status::Disabled) return;
     if (st.team.sampled_at)
         std::printf("SP %.1f / %.1f  (per cell %d)%s\n\n", st.team.atb, st.team.atb_max, st.team.atb_per_cell,
@@ -87,6 +99,25 @@ void Print(const State& st) {
         std::printf("[%zu]%s %-20s ult %6.1f/%-6.1f combo %5.1f/%-5.1f uid=%u%s\n", i,
             o.is_main_character ? "*" : " ", Short(o.entity_name).c_str(), o.ultimate_sp, o.max_ultimate_sp,
             o.combo_cd_remaining, o.combo_cooldown, o.instance_uid, efb::Fresh(h, o.sampled_at, now) ? "" : "  [stale]");
+    }
+    std::vector<const EFB_UnitState*> units;
+    for (const auto& u : st.units) units.push_back(&u);
+    std::sort(units.begin(), units.end(), [](const EFB_UnitState* a, const EFB_UnitState* b) {
+        return a->char_index != b->char_index ? (a->char_index < 0 ? 4 : a->char_index) < (b->char_index < 0 ? 4 : b->char_index)
+                                              : a->instance_uid < b->instance_uid;
+    });
+    std::printf("\n%-10s %-24s %-19s %-15s %s\n", "unit", "name", "hp", "poise", "break / recovery");
+    for (const EFB_UnitState* u : units) {
+        char who[16], hp[32], poise[32];
+        if (u->char_index >= 0) std::snprintf(who, sizeof(who), "[%d]", u->char_index);
+        else std::snprintf(who, sizeof(who), "%u", u->instance_uid);
+        std::snprintf(hp, sizeof(hp), "%.0f/%.0f", u->hp, u->max_hp);
+        if (u->has_poise) std::snprintf(poise, sizeof(poise), "%.1f/%.1f", u->poise, u->max_poise);
+        else std::snprintf(poise, sizeof(poise), "-");
+        std::printf("%-10s %-24.24s %-19s %-15s %s%s progress=%.2f rec=%.1f/%.1f%s\n", who, Short(u->entity_name).c_str(),
+            hp, poise, u->is_zero_poise ? "BROKEN " : "", u->in_poise_recovery ? "RECOVERING" : "",
+            u->poise_recovery_progress, u->poise_rec_time, u->sum_poise_rec_time,
+            efb::Fresh(h, u->sampled_at, now) ? "" : "  [stale]");
     }
     std::vector<const EFB_Buff*> buffs;
     for (const auto& b : st.buffs) buffs.push_back(&b);
@@ -132,6 +163,14 @@ int Events() {
         for (const EFB_Event& e : batch.events) {
             const char* name = EventName(e.type);
             if (!name) continue; // a type from a newer writer
+            if (e.type == EFB_EVENT_SKILL_CAST_STARTED || e.type == EFB_EVENT_SKILL_CAST_ENDED) {
+                const auto c = efb::Payload<EFB_SkillEventPayload>(e);
+                std::printf("#%-6llu f=%-7d %-9s caster=%u slot=%d type=%d cast=%u %s", (unsigned long long)e.serial,
+                    e.frame, name, c.caster_uid, c.char_index, c.skill_type, c.skill_cast_id, c.skill_id);
+                if (e.type == EFB_EVENT_SKILL_CAST_ENDED) std::printf(" finish=%d interrupt=%d", c.finish_type, c.interrupt_reason);
+                std::printf("\n");
+                continue;
+            }
             const auto p = efb::Payload<EFB_BuffEventPayload>(e);
             std::printf("#%-6llu f=%-7d %-9s key=%-5u %-44s stacks=%d", (unsigned long long)e.serial, e.frame, name,
                 p.key, p.buff_id, p.enhance_cnt);

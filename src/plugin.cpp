@@ -365,6 +365,14 @@ void ScanClass(void* klass, std::vector<Hit>& hits, std::vector<void*>& index) {
     if (IsSpRelated(name)) { hits.push_back({klass, "class name"}); QueueDetail(klass); }
     for (const char* w : kIndexWords) if (strstr(name, w)) { index.push_back(klass); break; }
     if (ui) for (const char* w : kUiDetailWords) if (strstr(name, w)) { QueueDetail(klass); break; }
+    // Nested types (enums, controllers, contexts) of the classes this plugin reads.
+    if (void* outer = il.il2cpp_class_get_declaring_type(klass)) {
+        const char* o = il.il2cpp_class_get_name(outer);
+        const char* oNs = il.il2cpp_class_get_namespace(outer);
+        static const char* const kOuter[] = {"Skill", "AbilitySystem", "Buff", "UIHeadBar", "HeadBarCtrl"};
+        if (name[0] != '<' && o && oNs && (!strcmp(oNs, "Beyond.Gameplay.Core") || !strcmp(oNs, "Beyond.UI")))
+            for (const char* k : kOuter) if (!strcmp(o, k)) { QueueDetail(klass); break; }
+    }
 
     void* it = nullptr;
     while (void* f = il.il2cpp_class_get_fields(klass, &it)) {
@@ -500,6 +508,14 @@ using AtbTickHook = applepie::NativeHook<1, TickFn>;
 using SquadTickHook = applepie::NativeHook<2, TickFn>;
 using SquadBuffHook = applepie::NativeHook<3, UiBuffIconFn>;
 using HeadBarBuffHook = applepie::NativeHook<4, UiBuffIconFn>;
+using HeadBarTickHook = applepie::NativeHook<5, TickFn>;
+// Skill.DoCast(Action, Action, Nullable<CastSkillOptions>, bool) and
+// Skill.CastEnd(FinishType, InterruptReason, Nullable<InterruptContext>):
+// each Nullable is one non-float slot (value or pointer to a caller copy).
+using CastStartFn = void(*)(void*, void*, void*, uint64_t, bool, void*);
+using CastEndFn = void(*)(void*, int32_t, int32_t, uint64_t, void*);
+using CastStartHook = applepie::NativeHook<6, CastStartFn>;
+using CastEndHook = applepie::NativeHook<7, CastEndFn>;
 
 // Offsets resolved by name at install time; -1 = unavailable.
 struct Offsets {
@@ -510,7 +526,7 @@ struct Offsets {
     int asEntity = -1, asUid = -1, asUltSp = -1, asDanger = -1, asSkills = -1;
     int sqIndex = -1, sqMain = -1, sqAbility = -1, sqEmpty = -1;
     int bmAtb = -1, bmAtbMax = -1, setPerCell = -1;
-    int skillType = -1, entName = -1, hbTarget = -1;
+    int skillType = -1, skillOwner = -1, skillId = -1, entName = -1, hbTarget = -1;
 } off;
 void* g_mGetBattleManager = nullptr;
 void* g_mGetSkillSetting = nullptr;
@@ -518,6 +534,9 @@ void* g_mMaxUltSp = nullptr;
 void* g_mCdRemaining = nullptr;
 void* g_mCooldown = nullptr;
 void* g_mFaction = nullptr;
+void* g_mSkillCastId = nullptr;
+void* g_mSkillInstId = nullptr;
+void* g_mIsCasting = nullptr;
 
 int FieldOffset(void* klass, const char* name) {
     for (void* k = klass; k; k = il.il2cpp_class_get_parent(k)) {
@@ -618,10 +637,10 @@ int FactionOf(void* ability) {
 // version. Each section has its own seqlock; Write() opens only the ones a
 // change touches. Writers: the game thread while probes are active; the
 // worker only between sessions.
-constexpr uint32_t OPERATOR_SLOTS = 4, BUFF_SLOTS = 256, EVENT_SLOTS = 512;
+constexpr uint32_t OPERATOR_SLOTS = 4, BUFF_SLOTS = 256, EVENT_SLOTS = 512, UNIT_SLOTS = 64;
 struct Layout {
     EFB_Header header;
-    EFB_Section directory[4];
+    EFB_Section directory[5];
     alignas(8) EFB_SectionHeader teamHead;
     EFB_Team team;
     alignas(8) EFB_SectionHeader opsHead;
@@ -630,6 +649,8 @@ struct Layout {
     EFB_Buff buffs[BUFF_SLOTS];
     alignas(8) EFB_EventsHeader eventsHead;
     EFB_Event events[EVENT_SLOTS];
+    alignas(8) EFB_UnitsHeader unitsHead;
+    EFB_UnitState units[UNIT_SLOTS];
 };
 static_assert(sizeof(Layout) <= EFB_MAPPING_SIZE, "layout fits the reserved mapping");
 HANDLE g_mapping = nullptr;
@@ -647,7 +668,7 @@ uint64_t ProcessStartTime() {
     return GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user) ? FileTimeValue(created) : 0;
 }
 
-enum : unsigned { W_HEADER = 1, W_TEAM = 2, W_OPS = 4, W_BUFFS = 8, W_EVENTS = 16 };
+enum : unsigned { W_HEADER = 1, W_TEAM = 2, W_OPS = 4, W_BUFFS = 8, W_EVENTS = 16, W_UNITS = 32 };
 void OpenSeq(volatile uint32_t& seq) { seq |= 1; }
 void CloseSeq(volatile uint32_t& seq) { seq += 1; }
 // Runs fn under the data lock with the selected sections marked busy; with
@@ -662,6 +683,7 @@ template<class Fn> void Write(unsigned sections, Fn fn) {
     if (sections & W_OPS) OpenSeq(l.opsHead.seq);
     if (sections & W_BUFFS) OpenSeq(l.buffsHead.common.seq);
     if (sections & W_EVENTS) OpenSeq(l.eventsHead.common.seq);
+    if (sections & W_UNITS) OpenSeq(l.unitsHead.common.seq);
     MemoryBarrier();
     __try { fn(); }
     __finally {
@@ -670,11 +692,13 @@ template<class Fn> void Write(unsigned sections, Fn fn) {
         if (sections & W_OPS) l.opsHead.updated_at = now;
         if (sections & W_BUFFS) l.buffsHead.common.updated_at = now;
         if (sections & W_EVENTS) l.eventsHead.common.updated_at = now;
+        if (sections & W_UNITS) l.unitsHead.common.updated_at = now;
         MemoryBarrier();
         if (sections & W_TEAM) CloseSeq(l.teamHead.seq);
         if (sections & W_OPS) CloseSeq(l.opsHead.seq);
         if (sections & W_BUFFS) CloseSeq(l.buffsHead.common.seq);
         if (sections & W_EVENTS) CloseSeq(l.eventsHead.common.seq);
+        if (sections & W_UNITS) CloseSeq(l.unitsHead.common.seq);
         MemoryBarrier();
         if (sections & W_HEADER) CloseSeq(l.header.seq);
         ReleaseSRWLockExclusive(&g_dataLock);
@@ -701,7 +725,7 @@ void InitLayout(uint32_t session) {
     h.header_size = sizeof(EFB_Header);
     h.total_size = sizeof(Layout);
     h.directory_offset = uint32_t(offsetof(Layout, directory));
-    h.section_count = 4;
+    h.section_count = 5;
     h.section_entry_size = sizeof(EFB_Section);
     h.session = session;
     h.writer_pid = GetCurrentProcessId();
@@ -712,6 +736,7 @@ void InitLayout(uint32_t session) {
     l.directory[1] = Describe(EFB_SECTION_OPERATORS, &l.opsHead, sizeof(l.opsHead), l.ops, OPERATOR_SLOTS);
     l.directory[2] = Describe(EFB_SECTION_BUFFS, &l.buffsHead, sizeof(l.buffsHead), l.buffs, BUFF_SLOTS);
     l.directory[3] = Describe(EFB_SECTION_EVENTS, &l.eventsHead, sizeof(l.eventsHead), l.events, EVENT_SLOTS);
+    l.directory[4] = Describe(EFB_SECTION_UNITS, &l.unitsHead, sizeof(l.unitsHead), l.units, UNIT_SLOTS);
     MemoryBarrier();
     l.header.seq = seq + 1;
 }
@@ -799,6 +824,7 @@ void* FindSkill(void* ability, int type) {
     }
     return nullptr;
 }
+void SampleUnit(const ObjPtr& ability, int charIndex, bool onHeadBar);
 void ProbeSquad(void* icon) {
     NoteThread("SquadIcon.LateTick");
     const int index = At<int32_t>(icon, off.sqIndex);
@@ -825,6 +851,7 @@ void ProbeSquad(void* icon) {
         if (combo && g_mCooldown) op.combo_cooldown = CallGetter<float>(g_mCooldown, combo);
     }
     Write(W_OPS, [&] { g_layout->ops[index] = op; });
+    if (live) SampleUnit(ability, index, false);
     SlotLog& last = g_slotLog[index];
     const ULONGLONG tick = GetTickCount64();
     const float ult = op.ultimate_sp, cd = op.combo_cd_remaining;
@@ -1106,6 +1133,178 @@ void SampleBuffs(int32_t frame, int64_t now) {
         if (t.info.enhance_cnt != stacks) PushEvent(EFB_EVENT_BUFF_ENHANCED, t, now, frame, SlotOf(t));
     }
 }
+// ---- Units: the squad and every unit with an enemy head bar ----
+// Sampled from SquadIcon.LateTick and UIHeadBar.UpdateData at the sample
+// interval. A unit leaves when its object goes away, or when nothing has
+// shown it for 60 HUD frames and 1 s (the head bar was removed).
+struct UnitTrack {
+    void* ability;              // valid only while its instance uid == state.instance_uid
+    uint32_t lastSeenFrame;     // g_hudFrames when a probe last saw it
+    int64_t lastSeenAt;
+    int64_t sampledAt;          // sample interval throttle
+    ULONGLONG loggedAt;
+    EFB_UnitState state;
+};
+UnitTrack g_units[UNIT_SLOTS]{};
+uint32_t g_hudFrames = 0;       // Tick() calls: frames in which the battle HUD ran
+uint32_t g_provides = 0;        // EFB_PROVIDES_*, set when optional probes install
+// Unit getters on AbilitySystem; any may be missing, then the field stays 0.
+void* g_mHp = nullptr;
+void* g_mMaxHp = nullptr;
+void* g_mPoise = nullptr;
+void* g_mMaxPoise = nullptr;
+void* g_mHasPoise = nullptr;
+void* g_mZeroPoise = nullptr;
+void* g_mInPoiseRecovery = nullptr;
+void* g_mPoiseProgress = nullptr;
+void* g_mPoiseRecTime = nullptr;
+void* g_mSumPoiseRecTime = nullptr;
+template<class R> R GetOr(void* method, void* self, R fallback) { return method ? CallGetter<R>(method, self) : fallback; }
+// False when the object faulted while being read.
+bool ReadUnitStats(void* ability, EFB_UnitState& u) {
+    __try {
+        u.hp = GetOr<double>(g_mHp, ability, 0);
+        u.max_hp = GetOr<double>(g_mMaxHp, ability, 0);
+        u.has_poise = GetOr<bool>(g_mHasPoise, ability, false);
+        u.poise = GetOr<float>(g_mPoise, ability, 0);
+        u.max_poise = GetOr<float>(g_mMaxPoise, ability, 0);
+        u.is_zero_poise = GetOr<bool>(g_mZeroPoise, ability, false);
+        u.in_poise_recovery = GetOr<bool>(g_mInPoiseRecovery, ability, false);
+        u.poise_recovery_progress = GetOr<float>(g_mPoiseProgress, ability, 0);
+        u.poise_rec_time = GetOr<float>(g_mPoiseRecTime, ability, 0);
+        u.sum_poise_rec_time = GetOr<float>(g_mSumPoiseRecTime, ability, 0);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+// Game thread. charIndex -1 = not a squad slot.
+void SampleUnit(const ObjPtr& ability, int charIndex, bool onHeadBar) {
+    if (!AbilityPtrLive(ability)) return;
+    const int64_t now = QpcNow();
+    Write(0, [&] {
+        UnitTrack* t = nullptr;
+        UnitTrack* free = nullptr;
+        for (auto& u : g_units) {
+            if (u.ability == ability.object && u.state.instance_uid == ability.uid) { t = &u; break; }
+            if (!free && !u.state.instance_uid) free = &u;
+        }
+        if (!t) {
+            if (!free) return; // more units than slots: the rest wait for a free one
+            t = free;
+            *t = UnitTrack{};
+            t->ability = ability.object;
+            t->state.instance_uid = ability.uid;
+            t->state.char_index = -1;
+            t->state.faction = int8_t(FactionOf(ability.object));
+            EntityName(ability.object, t->state.entity_name, sizeof(t->state.entity_name));
+        }
+        t->lastSeenFrame = g_hudFrames;
+        t->lastSeenAt = now;
+        t->state.char_index = int8_t(charIndex);
+        if (onHeadBar) t->state.on_head_bar = 1;
+        if (!SampleDue(t->sampledAt, now)) return;
+        EFB_UnitState s = t->state;
+        if (!ReadUnitStats(ability.object, s)) return;
+        s.sampled_at = now;
+        const bool poiseChanged = s.is_zero_poise != t->state.is_zero_poise ||
+            s.in_poise_recovery != t->state.in_poise_recovery;
+        t->state = s;
+        const ULONGLONG tick = GetTickCount64();
+        if ((poiseChanged || tick - t->loggedAt >= 2000) && ProbeLogAllowed()) {
+            t->loggedAt = tick;
+            LogF("[UNIT] t=%llu uid=%u slot=%d head=%d name=%s hp=%.1f/%.1f poise=%.2f/%.2f has=%d zero=%d rec=%d "
+                "progress=%.3f recTime=%.3f sumRecTime=%.3f", tick, s.instance_uid, s.char_index, s.on_head_bar,
+                s.entity_name, s.hp, s.max_hp, s.poise, s.max_poise, s.has_poise, s.is_zero_poise,
+                s.in_poise_recovery, s.poise_recovery_progress, s.poise_rec_time, s.sum_poise_rec_time);
+        }
+    });
+}
+bool UnitGone(const UnitTrack& u, int64_t now) {
+    __try {
+        if (At<uint32_t>(u.ability, off.asUid) != u.state.instance_uid) return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return true;
+    }
+    return g_hudFrames - u.lastSeenFrame > 60 && SecondsBetween(u.lastSeenAt, now) > 1.0f;
+}
+// Inside Write(W_UNITS).
+void MirrorUnits(int64_t now) {
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < UNIT_SLOTS; ++i) {
+        UnitTrack& u = g_units[i];
+        if (u.state.instance_uid && UnitGone(u, now)) u = UnitTrack{};
+        if (u.state.instance_uid && u.state.sampled_at) {
+            g_layout->units[i] = u.state;
+            ++count;
+        } else if (g_layout->units[i].instance_uid) {
+            g_layout->units[i] = EFB_UnitState{};
+        }
+    }
+    g_layout->unitsHead.count = count;
+}
+void ProbeHeadBar(void* bar) {
+    NoteThread("UIHeadBar.UpdateData");
+    const ObjPtr target = At<ObjPtr>(bar, off.hbTarget);
+    SampleUnit(target, SquadIndexOf(target.object), true);
+}
+
+// ---- Skill casts: Skill.DoCast / Skill.CastEnd ----
+int32_t SkillTypeOf(void* skill) { return At<int32_t>(skill, off.skillType); }
+// Normal attacks and dodges are not reported (EFB_SkillType).
+bool ReportedSkill(int32_t type) {
+    return type != EFB_SKILL_ATTACK && type != EFB_SKILL_BREAKING_ATTACK && type != EFB_SKILL_DODGE &&
+        type != EFB_SKILL_PASSIVE;
+}
+uint32_t g_castsSeen[10]{};     // debug: casts per SkillType + 1
+void PushSkillEvent(uint32_t type, void* skill, int32_t finishType, int32_t interruptReason) {
+    const ObjPtr owner = At<ObjPtr>(skill, off.skillOwner);
+    EFB_SkillEventPayload p{};
+    const bool live = AbilityPtrLive(owner);
+    p.caster_uid = live ? owner.uid : 0;
+    p.char_index = int8_t(live ? SquadIndexOf(owner.object) : -1);
+    p.faction = int8_t(live ? FactionOf(owner.object) : -1);
+    p.skill_type = SkillTypeOf(skill);
+    p.skill_cast_id = GetOr<uint32_t>(g_mSkillCastId, skill, 0);
+    p.skill_inst_id = GetOr<uint64_t>(g_mSkillInstId, skill, 0);
+    p.finish_type = finishType;
+    p.interrupt_reason = interruptReason;
+    if (off.skillId >= 0) ReadManagedString(At<void*>(skill, off.skillId), p.skill_id, sizeof(p.skill_id));
+    const int32_t frame = FrameNow();
+    const int64_t now = QpcNow();
+    Write(W_EVENTS, [&] {
+        const uint64_t serial = ++g_layout->eventsHead.head;
+        EFB_Event& e = g_layout->events[(serial - 1) % EVENT_SLOTS];
+        e = EFB_Event{};
+        e.serial = serial;
+        e.type = type;
+        e.payload_size = sizeof(EFB_SkillEventPayload);
+        e.frame = frame;
+        e.subject_uid = p.caster_uid;
+        e.at = now;
+        memcpy(e.payload, &p, sizeof(p));
+    });
+    if (ProbeLogAllowed())
+        LogF("[CAST%s] t=%llu frame=%d caster=%u slot=%d f=%d type=%d id=%s castId=%u inst=%llu finish=%d interrupt=%d",
+            type == EFB_EVENT_SKILL_CAST_STARTED ? "+" : "-", GetTickCount64(), frame, p.caster_uid, p.char_index,
+            p.faction, p.skill_type, p.skill_id, p.skill_cast_id, (unsigned long long)p.skill_inst_id, finishType,
+            interruptReason);
+}
+// After the original: DoCast may decline to start.
+void ProbeCastStart(void* skill) {
+    if (!(g_provides & EFB_PROVIDES_SKILL_CASTS)) return;
+    NoteThread("Skill.DoCast");
+    const int32_t type = SkillTypeOf(skill);
+    if (type >= -1 && type < 9) ++g_castsSeen[type + 1];
+    if (!ReportedSkill(type) || !CallGetter<bool>(g_mIsCasting, skill)) return;
+    PushSkillEvent(EFB_EVENT_SKILL_CAST_STARTED, skill, 0, 0);
+}
+// Before the original, while the skill still reports itself casting.
+void ProbeCastEnd(void* skill, int32_t finishType, int32_t interruptReason) {
+    if (!(g_provides & EFB_PROVIDES_SKILL_CASTS)) return;
+    if (!ReportedSkill(SkillTypeOf(skill)) || !CallGetter<bool>(g_mIsCasting, skill)) return;
+    PushSkillEvent(EFB_EVENT_SKILL_CAST_ENDED, skill, finishType, interruptReason);
+}
 // UI buff callbacks (game thread): record the change at the moment the game
 // reports it; settlement happens on the next frame.
 void ProbeBuff(const char* via, ObjPtr ref, bool applied, int32_t reason) {
@@ -1169,19 +1368,23 @@ void Tick() {
     const int32_t frame = FrameNow();
     if (frame == g_tickedFrame) return;
     g_tickedFrame = frame;
+    ++g_hudFrames;
     const int64_t now = QpcNow();
     const bool settle = g_buffsDirty && frame > g_settledFrame;
     const bool sample = SampleDue(g_buffsSampledAt, now);
     if (!settle && !sample) return;
     const uint32_t interval = uint32_t(g_sampleIntervalMs.load());
     const bool header = g_layout->header.sample_interval_ms != interval;
-    Write(W_BUFFS | W_EVENTS | (header ? W_HEADER : 0u), [&] {
+    Write(W_BUFFS | W_EVENTS | (header ? W_HEADER : 0u) | (sample ? W_UNITS : 0u), [&] {
         if (header) g_layout->header.sample_interval_ms = interval;
         if (settle) {
             SettleBuffs(frame);
             g_settledFrame = frame;
         }
-        if (sample) SampleBuffs(frame, now);
+        if (sample) {
+            SampleBuffs(frame, now);
+            MirrorUnits(now);
+        }
         MirrorBuffs();
     });
 }
@@ -1195,8 +1398,11 @@ void StartSession() {
     g_teamSampledAt = g_buffsSampledAt = 0;
     g_buffsDirty = false;
     g_settledFrame = g_tickedFrame = INT32_MIN;
+    for (auto& u : g_units) u = UnitTrack{};
+    memset(g_castsSeen, 0, sizeof(g_castsSeen));
+    g_hudFrames = 0;
     g_uiThread = 0;
-    Write(W_HEADER | W_TEAM | W_OPS | W_BUFFS | W_EVENTS, [&] {
+    Write(W_HEADER | W_TEAM | W_OPS | W_BUFFS | W_EVENTS | W_UNITS, [&] {
         Layout& l = *g_layout;
         ++l.header.session;
         l.header.session_started_at = QpcNow();
@@ -1205,6 +1411,9 @@ void StartSession() {
         memset(l.ops, 0, sizeof(l.ops));
         memset(l.buffs, 0, sizeof(l.buffs));
         l.buffsHead.count = l.buffsHead.dropped = 0;
+        memset(l.units, 0, sizeof(l.units));
+        l.unitsHead.count = 0;
+        l.header.provides = g_provides;
         // A re-enable starts in the middle of the game.
         l.buffsHead.flags = g_sessionsStarted++ ? EFB_BUFFS_PARTIAL : 0;
         l.header.active = 1;
@@ -1240,6 +1449,18 @@ void OnHeadBarBuff(void* self, ObjPtr buff, bool applied, int32_t reason, void* 
     Guarded([&] { ProbeBuff("headbar", buff, applied, reason); });
     HeadBarBuffHook::Original(self, buff, applied, reason, method);
 }
+void OnHeadBarTick(void* self, float dt, void* method) {
+    HeadBarTickHook::Original(self, dt, method);
+    Guarded([&] { ProbeHeadBar(self); });
+}
+void OnCastStart(void* self, void* onEnd, void* onExclusive, uint64_t options, bool skipCost, void* method) {
+    CastStartHook::Original(self, onEnd, onExclusive, options, skipCost, method);
+    Guarded([&] { ProbeCastStart(self); });
+}
+void OnCastEnd(void* self, int32_t finishType, int32_t interruptReason, uint64_t context, void* method) {
+    Guarded([&] { ProbeCastEnd(self, finishType, interruptReason); });
+    CastEndHook::Original(self, finishType, interruptReason, context, method);
+}
 
 template<class H, class Fn> APH_Result InstallProbe(void* method, uint64_t key, Fn body,
     const char* signature, const char* label) {
@@ -1255,6 +1476,26 @@ template<class H, class Fn> APH_Result InstallProbe(void* method, uint64_t key, 
     return r;
 }
 
+// A value type of 1/2/4/8 bytes travels in one register, a bigger one as a
+// pointer to a caller copy: either way one non-float slot.
+bool OneSlotNonFloat(void* type) {
+    if (!type) return false;
+    const int t = il.il2cpp_type_get_type(type);
+    return t != 0x0C && t != 0x0D; // R4 / R8
+}
+// An instance method by name and parameter count (types checked by the caller).
+void* FindMethodArity(void* klass, const char* name, uint32_t params) {
+    void* it = nullptr;
+    while (void* m = klass ? il.il2cpp_class_get_methods(klass, &it) : nullptr) {
+        const char* n = il.il2cpp_method_get_name(m);
+        uint32_t impl = 0;
+        if (n && !strcmp(n, name) && il.il2cpp_method_get_param_count(m) == params && !il.il2cpp_method_is_generic(m) &&
+            !(il.il2cpp_method_get_flags(m, &impl) & METHOD_STATIC) && *reinterpret_cast<void**>(m))
+            return m;
+    }
+    LogF("[ABI] method %s.%s/%u not found", klass ? il.il2cpp_class_get_name(klass) : "?", name, params);
+    return nullptr;
+}
 bool EnumIsI32(void* type) {
     void* klass = type ? il.il2cpp_class_from_type(type) : nullptr;
     if (!klass || !il.il2cpp_class_is_enum(klass)) return false;
@@ -1309,6 +1550,8 @@ bool ResolveProbeOffsets(void** asms, size_t count) {
     off.asDanger = FieldOffset(as, "<isDangerousEnemy>k__BackingField");
     off.asSkills = FieldOffset(as, "m_skills");
     off.skillType = FieldOffset(skill, "<skillType>k__BackingField");
+    off.skillOwner = FieldOffset(skill, "m_owner");
+    off.skillId = FieldOffset(skill, "m_skillId");
     off.entName = FieldOffset(entity, "<name>k__BackingField");
     off.sqIndex = FieldOffset(squad, "m_charIndex");
     off.sqMain = FieldOffset(squad, "m_isMainCharacter");
@@ -1325,6 +1568,21 @@ bool ResolveProbeOffsets(void** asms, size_t count) {
     g_mCooldown = FindMethodChecked(skill, "get_cooldown", "System.Single", {});
     g_mFaction = FindMethodChecked(as, "get_factionIndex", "Beyond.Gameplay.Core.FactionIndex", {});
     if (g_mFaction && !EnumIsI32(il.il2cpp_method_get_return_type(g_mFaction))) g_mFaction = nullptr;
+    // Units (all optional: a missing getter leaves its field 0).
+    g_mHp = FindMethodChecked(as, "get_hp", "System.Double", {});
+    g_mMaxHp = FindMethodChecked(as, "get_maxHp", "System.Double", {});
+    g_mPoise = FindMethodChecked(as, "get_poise", "System.Single", {});
+    g_mMaxPoise = FindMethodChecked(as, "get_maxPoise", "System.Single", {});
+    g_mHasPoise = FindMethodChecked(as, "get_hasPoise", "System.Boolean", {});
+    g_mZeroPoise = FindMethodChecked(as, "get_isZeroPoise", "System.Boolean", {});
+    g_mInPoiseRecovery = FindMethodChecked(as, "get_inPoiseRecovery", "System.Boolean", {});
+    g_mPoiseProgress = FindMethodChecked(as, "get_poiseRecoveryProgress", "System.Single", {});
+    g_mPoiseRecTime = FindMethodChecked(as, "get_poiseRecTime", "System.Single", {});
+    g_mSumPoiseRecTime = FindMethodChecked(as, "get_sumPoiseRecTime", "System.Single", {});
+    // Skill casts (optional together with their hooks).
+    g_mSkillCastId = FindMethodChecked(skill, "get_skillCastId", "System.UInt32", {});
+    g_mSkillInstId = FindMethodChecked(skill, "get_instId", "System.UInt64", {});
+    g_mIsCasting = FindMethodChecked(skill, "get_isCasting", "System.Boolean", {});
     // Static icall: int32_t(MethodInfo*). Pairs a refresh's DEL and ADD by frame.
     void* time = FindClassAny(asms, count, "UnityEngine", "Time");
     void* fc = time ? il.il2cpp_class_get_method_from_name(time, "get_frameCount", 0) : nullptr;
@@ -1367,8 +1625,34 @@ APH_Result InstallProbes(void** asms, size_t count) {
     m = FindMethodChecked(headBar, "_OnBuffIconChange", "System.Void",
         {buffParams[0], buffParams[1], buffParams[2]});
     if (!m || !BuffRefIs16(m) || !EnumIsI32(il.il2cpp_method_get_param(m, 2))) return APH_E_SIGNATURE;
-    return InstallProbe<HeadBarBuffHook>(m, 4, OnHeadBarBuff, "void(self,ObjectPtr<Buff>16*,bool,i32,MethodInfo*)",
+    r = InstallProbe<HeadBarBuffHook>(m, 4, OnHeadBarBuff, "void(self,ObjectPtr<Buff>16*,bool,i32,MethodInfo*)",
         "UIHeadBar._OnBuffIconChange");
+    if (r != APH_OK) return r;
+    // Optional: without them the units section holds the squad only and no cast events appear.
+    g_provides = 0;
+    if (off.hbTarget >= 0 && InstallProbe<HeadBarTickHook>(
+            FindMethodChecked(headBar, "UpdateData", "System.Void", {"System.Single"}), 5, OnHeadBarTick,
+            "void(self,f32,MethodInfo*)", "UIHeadBar.UpdateData") == APH_OK)
+        g_provides |= EFB_PROVIDES_HEAD_BAR_UNITS;
+    void* skill = FindClassAny(asms, count, "Beyond.Gameplay.Core", "Skill");
+    void* start = FindMethodArity(skill, "DoCast", 4);
+    void* end = FindMethodArity(skill, "CastEnd", 3);
+    const bool castAbi = start && end && g_mIsCasting && off.skillType >= 0 && off.skillOwner >= 0 &&
+        OneSlotNonFloat(il.il2cpp_method_get_param(start, 0)) && OneSlotNonFloat(il.il2cpp_method_get_param(start, 1)) &&
+        OneSlotNonFloat(il.il2cpp_method_get_param(start, 2)) &&
+        TypeName(il.il2cpp_method_get_param(start, 3)) == "System.Boolean" &&
+        EnumIsI32(il.il2cpp_method_get_param(end, 0)) && EnumIsI32(il.il2cpp_method_get_param(end, 1)) &&
+        OneSlotNonFloat(il.il2cpp_method_get_param(end, 2)) &&
+        TypeName(il.il2cpp_method_get_return_type(start)) == "System.Void" &&
+        TypeName(il.il2cpp_method_get_return_type(end)) == "System.Void";
+    if (!castAbi) LogF("[ABI] Skill.DoCast/CastEnd signature changed: no cast events");
+    else if (InstallProbe<CastStartHook>(start, 6, OnCastStart, "void(self,Action*,Action*,Nullable slot,bool,MethodInfo*)",
+                 "Skill.DoCast") == APH_OK &&
+             InstallProbe<CastEndHook>(end, 7, OnCastEnd, "void(self,i32,i32,Nullable slot,MethodInfo*)",
+                 "Skill.CastEnd") == APH_OK)
+        g_provides |= EFB_PROVIDES_SKILL_CASTS;
+    LogF("optional probes: provides=0x%x", g_provides);
+    return APH_OK;
 }
 
 APH_Result Setup() {
