@@ -1,12 +1,17 @@
-// Offline data-path tests. The plugin source is compiled into this exe so the
+// Offline data-path tests. The plugin sources are linked into this exe so the
 // tracker runs against fake Buff / AbilitySystem objects laid out at known
 // offsets, with a fake frame counter and clock. Every result is checked
 // through the reference reader (include/endfield_bridge_reader.h), the same
 // code a consumer uses. No IL2CPP or game needed.
-#include "../src/plugin.cpp"
+#include "../src/bridge.h"
 #include "../include/endfield_bridge_reader.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstring>
+#include <vector>
+
+using namespace bridge;
 
 #define CHECK(expression) do { \
     if (!(expression)) { \
@@ -507,7 +512,10 @@ FakeMethod g_fakeSumRecTime{reinterpret_cast<void*>(&FakeGetter<float, kSumRecTi
 FakeMethod g_fakeIsCasting{reinterpret_cast<void*>(&FakeGetter<bool, 0x30>)};
 FakeMethod g_fakeCastId{reinterpret_cast<void*>(&FakeGetter<uint32_t, 0x34>)};
 FakeMethod g_fakeInstId{reinterpret_cast<void*>(&FakeGetter<uint64_t, 0x38>)};
-struct FakeUnit { alignas(8) char bytes[0x40]{}; };
+// Poise recovery timer: AbilitySystem 0x40 -> PoiseController 0x10 -> PeriodicTimer m_remainingTime 0x14.
+struct FakeTimer { alignas(8) char bytes[0x20]{}; };
+struct FakePoiseCtl { alignas(8) char bytes[0x20]{}; };
+struct FakeUnit { alignas(8) char bytes[0x48]{}; };
 struct FakeSkill { alignas(8) char bytes[0x40]{}; FakeString id; };
 void SetUpUnitGetters() {
     g_mFaction = &g_fakeFaction;
@@ -518,6 +526,7 @@ void SetUpUnitGetters() {
     off.skillType = 0x10; off.skillOwner = 0x18; off.skillId = 0x28;
     off.sqIndex = 0x10; off.sqAbility = 0x18; off.sqEmpty = 0x28; off.sqMain = 0x29;
     off.hbTarget = 0x10;
+    off.asPoiseCtl = 0x40; off.pcRecoverTimer = 0x10; off.ptRemaining = 0x14;
 }
 void MakeUnit(FakeUnit& u, uint32_t uid, int32_t faction, double hp, double maxHp, float poise, float maxPoise) {
     memset(u.bytes, 0, sizeof(u.bytes));
@@ -572,7 +581,14 @@ void TestUnits() {
     CHECK(b && b->char_index == -1 && b->on_head_bar && b->hp == 50000 && b->max_hp == 60000 && b->has_poise &&
         b->poise == 40 && b->max_poise == 100 && b->faction == EFB_FACTION_BAD);
 
-    // Broken, then recovering: raw fields as the game reports them.
+    CHECK(a->poise_recovery_left == -1 && b->poise_recovery_left == -1);
+
+    // Broken, then recovering: raw fields as the game reports them, and the countdown.
+    FakeTimer timer{};
+    FakePoiseCtl ctl{};
+    Put<float>(timer.bytes, off.ptRemaining, 7.5f);
+    Put<void*>(ctl.bytes, off.pcRecoverTimer, timer.bytes);
+    Put<void*>(boss.bytes, off.asPoiseCtl, ctl.bytes);
     Put<float>(boss.bytes, kPoise, 0);
     Put<bool>(boss.bytes, kZeroPoise, true);
     Put<bool>(boss.bytes, kInRecovery, true);
@@ -584,7 +600,15 @@ void TestUnits() {
     NextFrame();
     b = FindUnit(units = Units(), 77);
     CHECK(b && b->is_zero_poise && b->in_poise_recovery && b->poise_recovery_progress == 0.25f &&
-        b->poise_rec_time == 1.5f && b->sum_poise_rec_time == 6.0f && b->hp == 42000);
+        b->poise_rec_time == 1.5f && b->sum_poise_rec_time == 6.0f && b->hp == 42000 &&
+        b->poise_recovery_left == 7.5f);
+    // Recovered: the timer keeps its last value, the countdown does not.
+    Put<bool>(boss.bytes, kInRecovery, false);
+    Put<float>(timer.bytes, off.ptRemaining, -1.0f);
+    ProbeHeadBar(bar);
+    NextFrame();
+    b = FindUnit(units = Units(), 77);
+    CHECK(b && !b->in_poise_recovery && b->poise_recovery_left == -1);
 
     // The head bar goes away: the unit stays a short while, then leaves; the squad member stays.
     for (int i = 0; i < 30; ++i) { ProbeSquad(icon); NextFrame(); }
@@ -602,15 +626,19 @@ void TestUnits() {
     // A new session starts empty.
     Reset();
     CHECK(Units().empty());
-    std::puts("[OK] Units: squad and head-bar units with HP and poise, removal when gone");
+    std::puts("[OK] Units: squad and head-bar units with HP, poise and recovery countdown, removal when gone");
 }
 
 void TestSkillCasts() {
     Reset();
     g_provides = EFB_PROVIDES_SKILL_CASTS;
-    FakeUnit enemy{};
+    FakeUnit enemy{}, projectile{};
     MakeUnit(enemy, 77, EFB_FACTION_BAD, 100, 100, 0, 0);
-    FakeSkill attack{}, ult{};
+    MakeUnit(projectile, 88, EFB_FACTION_GOOD, 1, 1, 0, 0);
+    alignas(8) char bar[0x20]{};
+    Put<ObjPtr>(bar, off.hbTarget, ObjPtr{enemy.bytes, 77, 0});
+    ProbeHeadBar(bar); // the enemy has a head bar; the projectile is neither squad nor head bar
+    FakeSkill attack{}, ult{}, hit{};
     auto make = [](FakeSkill& s, int32_t type, FakeUnit& owner, uint32_t ownerUid, const char* id, uint32_t castId) {
         memset(s.bytes, 0, sizeof(s.bytes));
         SetString(s.id, id);
@@ -622,19 +650,22 @@ void TestSkillCasts() {
     };
     make(attack, EFB_SKILL_ATTACK, enemy, 77, "eny_attack", 1);
     make(ult, EFB_SKILL_ULTIMATE, enemy, 77, "eny_ultimate", 2);
+    make(hit, EFB_SKILL_NORMAL, projectile, 88, "chr_normal_skill_projhit", 3);
     // Normal attacks are not reported.
     Put<bool>(attack.bytes, 0x30, true);
     ProbeCastStart(attack.bytes);
     ProbeCastEnd(attack.bytes, 0, 0);
+    // Skills of helper units (projectiles, summons) are not reported.
+    Put<bool>(hit.bytes, 0x30, true);
+    ProbeCastStart(hit.bytes);
+    ProbeCastEnd(hit.bytes, 0, 0);
     CHECK(NewEvents().empty());
-    // DoCast that did not start casting reports nothing.
+    // Start is reported when the cast begins, before the skill reports itself casting.
     ProbeCastStart(ult.bytes);
-    CHECK(NewEvents().empty());
     Put<bool>(ult.bytes, 0x30, true);
-    ProbeCastStart(ult.bytes);
-    ProbeCastEnd(ult.bytes, 3, 5);
+    ProbeCastEnd(ult.bytes, 1, 5);
     Put<bool>(ult.bytes, 0x30, false);
-    ProbeCastEnd(ult.bytes, 3, 5); // a second end after the cast finished
+    ProbeCastEnd(ult.bytes, 1, 5); // a second end after the cast finished
     efb::Header h;
     CHECK(efb::ReadHeader(g_reader, h) == efb::Result::Ok);
     efb::EventBatch batch;
@@ -645,13 +676,13 @@ void TestSkillCasts() {
     CHECK(batch.events[0].subject_uid == 77 && s0.caster_uid == 77 && s0.char_index == -1 && s0.faction == EFB_FACTION_BAD &&
         s0.skill_type == EFB_SKILL_ULTIMATE && s0.skill_cast_id == 2 && s0.skill_inst_id == 9002 &&
         !strcmp(s0.skill_id, "eny_ultimate"));
-    CHECK(s1.skill_cast_id == s0.skill_cast_id && s1.finish_type == 3 && s1.interrupt_reason == 5);
+    CHECK(s1.skill_cast_id == s0.skill_cast_id && s1.finish_type == 1 && s1.interrupt_reason == 5);
     // Not installed: nothing.
     g_provides = 0;
     Put<bool>(ult.bytes, 0x30, true);
     ProbeCastStart(ult.bytes);
     CHECK(NewEvents().empty());
-    std::puts("[OK] Skill casts: start/end paired by cast id, normal attacks and non-starts not reported");
+    std::puts("[OK] Skill casts: squad and head-bar casters only, start/end paired by cast id, no normal attacks");
 }
 
 // A reader thread, via the reference reader, while the game thread writes:

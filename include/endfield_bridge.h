@@ -1,4 +1,4 @@
-// EndfieldDataBridge shared memory (read-only for consumers), ABI 1.1.
+// EndfieldDataBridge shared memory (read-only for consumers), ABI 1.2.
 // include/endfield_bridge_reader.h implements every rule below.
 //
 // Mapping: EFB_MAPPING_NAME, EFB_MAPPING_SIZE bytes reserved, total_size used.
@@ -52,9 +52,11 @@
 // and sources. A unit leaves when its head bar has not updated for a while
 // or the game object goes away.
 //
-// Skill casts: start and end of squad and enemy skills, excluding normal
-// attacks (SkillType Attack / BreakingAttack) and dodges. A cast's end is not
-// the end of its effect: a transformation or lasting effect ends with its buff.
+// Skill casts: start and end of skills cast by squad members and by units
+// with an enemy head bar, excluding normal attacks (SkillType Attack /
+// BreakingAttack) and dodges. Skills of projectiles, summons and other
+// helper units are not reported. A cast's end is not the end of its effect:
+// a transformation or lasting effect ends with its buff.
 //
 // Buffs: buffs reported by the squad portraits and enemy head bars. A buff
 // keeps its `key` across refreshes within a session; EFB_BuffsHeader.flags
@@ -78,7 +80,7 @@
 #define EFB_MAPPING_SIZE (1u << 20)
 #define EFB_MAGIC 0x44424645u /* "EFBD" */
 #define EFB_ABI_MAJOR 1u
-#define EFB_ABI_MINOR 1u
+#define EFB_ABI_MINOR 2u
 #define EFB_NAME_LEN 64
 #define EFB_ID_LEN 96
 #define EFB_EVENT_PAYLOAD 128
@@ -249,6 +251,8 @@ typedef struct EFB_UnitState {
     float poise_rec_time;      // AbilitySystem.poiseRecTime (seconds)
     float sum_poise_rec_time;  // AbilitySystem.sumPoiseRecTime (seconds)
     int64_t sampled_at;
+    float poise_recovery_left; // seconds until poise is restored while in_poise_recovery, else -1; since 1.2
+    uint32_t reserved2;
 } EFB_UnitState;
 
 typedef struct EFB_Event {
@@ -292,7 +296,7 @@ static_assert(sizeof(EFB_SectionHeader) == 16, "EFB_SectionHeader layout");
 static_assert(sizeof(EFB_BuffsHeader) == 32, "EFB_BuffsHeader layout");
 static_assert(sizeof(EFB_EventsHeader) == 24, "EFB_EventsHeader layout");
 static_assert(sizeof(EFB_UnitsHeader) == 24, "EFB_UnitsHeader layout");
-static_assert(sizeof(EFB_UnitState) == 120, "EFB_UnitState layout");
+static_assert(sizeof(EFB_UnitState) == 128, "EFB_UnitState layout");
 static_assert(sizeof(EFB_SkillEventPayload) <= EFB_EVENT_PAYLOAD, "EFB_SkillEventPayload fits");
 static_assert(sizeof(EFB_Unit) == 72, "EFB_Unit layout");
 static_assert(sizeof(EFB_Team) == 24, "EFB_Team layout");

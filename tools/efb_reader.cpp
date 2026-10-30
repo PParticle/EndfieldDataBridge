@@ -114,8 +114,11 @@ void Print(const State& st) {
         std::snprintf(hp, sizeof(hp), "%.0f/%.0f", u->hp, u->max_hp);
         if (u->has_poise) std::snprintf(poise, sizeof(poise), "%.1f/%.1f", u->poise, u->max_poise);
         else std::snprintf(poise, sizeof(poise), "-");
-        std::printf("%-10s %-24.24s %-19s %-15s %s%s progress=%.2f rec=%.1f/%.1f%s\n", who, Short(u->entity_name).c_str(),
-            hp, poise, u->is_zero_poise ? "BROKEN " : "", u->in_poise_recovery ? "RECOVERING" : "",
+        char left[24] = "";
+        if (u->in_poise_recovery && u->poise_recovery_left >= 0)
+            std::snprintf(left, sizeof(left), " %.1fs left", u->poise_recovery_left);
+        std::printf("%-10s %-24.24s %-19s %-15s %s%s%s progress=%.2f rec=%.1f/%.1f%s\n", who, Short(u->entity_name).c_str(),
+            hp, poise, u->is_zero_poise ? "BROKEN " : "", u->in_poise_recovery ? "RECOVERING" : "", left,
             u->poise_recovery_progress, u->poise_rec_time, u->sum_poise_rec_time,
             efb::Fresh(h, u->sampled_at, now) ? "" : "  [stale]");
     }
