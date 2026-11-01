@@ -136,6 +136,9 @@ bool ResolveProbeOffsets(void** asms, size_t count) {
     off.ptRemaining = recoverTimer ? FieldOffset(recoverTimer, "m_remainingTime") : -1;
     off.bmAtb = FieldOffset(bm, "m_atb");
     off.bmAtbMax = FieldOffset(bm, "<atbMax>k__BackingField");
+    off.bmLockTarget = FieldOffset(bm, "m_lockTarget"); // optional, with the two flags
+    off.bmLockMode = FieldOffset(bm, "m_inLockTargetMode");
+    off.bmAutoLock = FieldOffset(bm, "<isAutoLockTarget>k__BackingField");
     off.setPerCell = FieldOffset(setting, "atbPerCell");
     g_mGetBattleManager = FindMethodChecked(node, "get_battleManager", "Beyond.Gameplay.Core.BattleManager", {});
     g_mGetSkillSetting = FindMethodChecked(node, "get_skillSetting", "Beyond.Gameplay.SkillSetting", {});
@@ -254,6 +257,7 @@ void MarkWriterStopped() {
 int64_t g_teamSampledAt = 0;
 ULONGLONG g_lastAtbLog = 0;
 float g_lastAtb = -1, g_lastAtbMax = -1;
+uint32_t g_lastLock = 0;
 void ProbeAtb(void* node) {
     NoteThread("AtbNode.LateTick");
     const int64_t now = QpcNow();
@@ -266,7 +270,18 @@ void ProbeAtb(void* node) {
     team.atb_max = At<float>(bm, off.bmAtbMax);
     team.atb_per_cell = setting && off.setPerCell >= 0 ? At<int32_t>(setting, off.setPerCell) : -1;
     team.sampled_at = now;
+    const ObjPtr lock = off.bmLockTarget >= 0 ? At<ObjPtr>(bm, off.bmLockTarget) : ObjPtr{};
+    const bool locked = AbilityPtrLive(lock);
+    team.lock_target_uid = locked ? lock.uid : 0;
+    team.lock_mode = off.bmLockMode >= 0 && At<bool>(bm, off.bmLockMode);
+    team.auto_lock = off.bmAutoLock >= 0 && At<bool>(bm, off.bmAutoLock);
     Write(W_TEAM, [&] { g_layout->team = team; });
+    // The locked enemy is always in the units section, head bar or not.
+    if (locked) SampleUnit(lock, SquadIndexOf(lock.object), false);
+    if (team.lock_target_uid != g_lastLock && ProbeLogAllowed())
+        LogF("[LOCK] t=%llu target=%u mode=%d auto=%d", GetTickCount64(), team.lock_target_uid, team.lock_mode,
+            team.auto_lock);
+    g_lastLock = team.lock_target_uid;
     const ULONGLONG tick = GetTickCount64();
     const bool changed = team.atb - g_lastAtb > 0.5f || g_lastAtb - team.atb > 0.5f || team.atb_max != g_lastAtbMax;
     if (!(changed && tick - g_lastAtbLog >= 200) && tick - g_lastAtbLog < 5000) return;

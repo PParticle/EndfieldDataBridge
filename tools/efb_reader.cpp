@@ -88,7 +88,8 @@ void Print(const State& st) {
         st.buffsHead.count, st.units.size(), flags.empty() ? " -" : flags.c_str());
     if (status == efb::Status::WriterGone || status == efb::Status::Disabled) return;
     if (st.team.sampled_at)
-        std::printf("SP %.1f / %.1f  (per cell %d)%s\n\n", st.team.atb, st.team.atb_max, st.team.atb_per_cell,
+        std::printf("SP %.1f / %.1f  (per cell %d)  lock %u%s%s\n\n", st.team.atb, st.team.atb_max,
+            st.team.atb_per_cell, st.team.lock_target_uid, st.team.auto_lock ? " (auto)" : "",
             efb::Fresh(h, st.team.sampled_at, now) ? "" : "  [stale]");
     else
         std::printf("SP -\n\n");
@@ -110,7 +111,8 @@ void Print(const State& st) {
     for (const EFB_UnitState* u : units) {
         char who[16], hp[32], poise[32];
         if (u->char_index >= 0) std::snprintf(who, sizeof(who), "[%d]", u->char_index);
-        else std::snprintf(who, sizeof(who), "%u", u->instance_uid);
+        else std::snprintf(who, sizeof(who), "%u%s", u->instance_uid,
+            u->instance_uid == st.team.lock_target_uid ? "*" : "");
         std::snprintf(hp, sizeof(hp), "%.0f/%.0f", u->hp, u->max_hp);
         if (u->has_poise) std::snprintf(poise, sizeof(poise), "%.1f/%.1f", u->poise, u->max_poise);
         else std::snprintf(poise, sizeof(poise), "-");

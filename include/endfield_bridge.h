@@ -47,9 +47,9 @@
 //   elapsed   = min(seconds since sampled_at, 0.25)
 //   life_left = max(life_time - elapsed * time_dilation, 0)
 //
-// Units: the squad and every unit that has an enemy head bar, one element per
-// unit (skip instance_uid == 0), keyed by the same instance_uid as buff owners
-// and sources. A unit leaves when its head bar has not updated for a while
+// Units: the squad, every unit that has an enemy head bar, and the locked
+// enemy (EFB_Team.lock_target_uid), one element per unit (skip
+// instance_uid == 0), keyed by the same instance_uid as buff owners and sources. A unit leaves when its head bar has not updated for a while
 // or the game object goes away.
 //
 // Skill casts: start and end of skills cast by squad members and by units
@@ -191,6 +191,10 @@ typedef struct EFB_Team {
     int32_t atb_per_cell;      // SP per skill cell, -1 = unknown
     uint32_t reserved;
     int64_t sampled_at;
+    uint32_t lock_target_uid;  // BattleManager.lockTarget: the locked enemy, 0 = none; since 1.2
+    uint8_t lock_mode;         // manual lock-on is active (BattleManager.inLockTargetMode); since 1.2
+    uint8_t auto_lock;         // the target was chosen by auto lock (BattleManager.isAutoLockTarget); since 1.2
+    uint16_t reserved2;
 } EFB_Team;
 
 typedef struct EFB_Operator {
@@ -299,7 +303,7 @@ static_assert(sizeof(EFB_UnitsHeader) == 24, "EFB_UnitsHeader layout");
 static_assert(sizeof(EFB_UnitState) == 128, "EFB_UnitState layout");
 static_assert(sizeof(EFB_SkillEventPayload) <= EFB_EVENT_PAYLOAD, "EFB_SkillEventPayload fits");
 static_assert(sizeof(EFB_Unit) == 72, "EFB_Unit layout");
-static_assert(sizeof(EFB_Team) == 24, "EFB_Team layout");
+static_assert(sizeof(EFB_Team) == 32, "EFB_Team layout");
 static_assert(sizeof(EFB_Operator) == 96, "EFB_Operator layout");
 static_assert(sizeof(EFB_Buff) == 568, "EFB_Buff layout");
 static_assert(offsetof(EFB_Event, payload) == 32 && sizeof(EFB_Event) == 32 + EFB_EVENT_PAYLOAD, "EFB_Event layout");

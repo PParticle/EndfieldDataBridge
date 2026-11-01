@@ -629,6 +629,41 @@ void TestUnits() {
     std::puts("[OK] Units: squad and head-bar units with HP, poise and recovery countdown, removal when gone");
 }
 
+// The locked enemy comes from BattleManager (via AtbNode.get_battleManager)
+// and is put in the units section even without a head bar.
+FakeMethod g_fakeBattleManager{reinterpret_cast<void*>(&FakeGetter<void*, 0x10>)};
+void TestLockTarget() {
+    Reset();
+    g_mGetBattleManager = &g_fakeBattleManager;
+    g_mGetSkillSetting = nullptr;
+    off.bmAtb = 0x10; off.bmAtbMax = 0x14; off.bmLockTarget = 0x18; off.bmLockMode = 0x28; off.bmAutoLock = 0x29;
+    FakeUnit enemy{};
+    MakeUnit(enemy, 99, EFB_FACTION_BAD, 300, 500, 10, 20);
+    alignas(8) char bm[0x30]{}, node[0x20]{};
+    Put<void*>(node, 0x10, bm);
+    Put<float>(bm, off.bmAtb, 150);
+    Put<float>(bm, off.bmAtbMax, 300);
+    ProbeAtb(node);
+    NextFrame();
+    View v = Read();
+    CHECK(v.team.atb == 150 && v.team.atb_max == 300 && v.team.atb_per_cell == -1 && v.team.lock_target_uid == 0);
+    Put<ObjPtr>(bm, off.bmLockTarget, ObjPtr{enemy.bytes, 99, 0});
+    Put<bool>(bm, off.bmLockMode, true);
+    ProbeAtb(node);
+    NextFrame();
+    v = Read();
+    CHECK(v.team.lock_target_uid == 99 && v.team.lock_mode == 1 && v.team.auto_lock == 0);
+    const EFB_UnitState* u = FindUnit(Units(), 99);
+    CHECK(u && !u->on_head_bar && u->hp == 300 && u->poise == 10);
+    // A stale ObjectPtr (object reused) is no lock.
+    Put<uint32_t>(enemy.bytes, off.asUid, 100);
+    ProbeAtb(node);
+    NextFrame();
+    CHECK(Read().team.lock_target_uid == 0);
+    g_mGetBattleManager = nullptr;
+    std::puts("[OK] Lock target: uid and flags from BattleManager, locked enemy in the units section");
+}
+
 void TestSkillCasts() {
     Reset();
     g_provides = EFB_PROVIDES_SKILL_CASTS;
@@ -795,6 +830,7 @@ int main() {
     TestCompatibility();
     SetUpUnitGetters();
     TestUnits();
+    TestLockTarget();
     TestSkillCasts();
     TestConcurrentReader();
     std::puts("[PASS] EndfieldDataBridge offline data verification");
