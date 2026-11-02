@@ -78,7 +78,7 @@ cd D:\Workspace\src\EndfieldDataBridge
 .\build.bat
 ```
 
-脚本使用 `vswhere` 查找 Build Tools 并初始化 x64 MSVC；也支持已配置好的 x64 Developer Command Prompt。输出在 `bin\`（`EndfieldDataBridge.dll` 和 `efb_reader.exe`），使用静态 MSVC 运行库。
+脚本使用 `vswhere` 查找 Build Tools 并初始化 x64 MSVC；也支持已配置好的 x64 Developer Command Prompt。输出位于 `bin\`（`EndfieldDataBridge.dll` 和 `efb_reader.exe`），使用静态 MSVC 运行库。
 
 ## 离线验证
 
@@ -86,16 +86,8 @@ cd D:\Workspace\src\EndfieldDataBridge
 .\build.bat /verify
 ```
 
-验证宿主链接相邻仓库的真实 Core 和其 MinHook 依赖，再加载实际生成的 DLL。检查只读清单、导出入口、Attach、启用、停用恢复、再次启用及旧 epoch 拒绝。随后运行数据验证：用伪造的 Buff 对象检查刷新合并、层数事件、同帧添加结束、对象复用、溢出计数、存活判断、分段独立和并发读取一致性，并用手工构造的新旧版本布局检查兼容读取。验证在独立进程中运行，不需要启动游戏。
+验证宿主链接相邻仓库的真实 Core 和其 MinHook 依赖，再加载实际生成的 DLL。检查只读清单、导出入口、Attach、启用、停用恢复、再次启用及旧 epoch 拒绝。随后运行数据验证：用 Buff 对象检查刷新合并、层数事件、同帧添加结束、对象复用、溢出计数、存活判断、分段独立和并发读取一致，检查兼容读取。验证在独立进程中运行，不需要启动游戏。
 
-## 发布
-
-将 `src/version.rc` 中的产品版本更新并提交后，推送对应的 `v*` 标签（例如 `v0.5.0`）会触发 Windows 构建和离线验证。标签版本必须与 DLL 的 `ProductVersion` 一致；验证通过后，Actions 会创建 GitHub Release，并附上包含 DLL、读取工具、README 和许可证的 ZIP。
-
-```text
-git tag v0.5.0
-git push origin v0.5.0
-```
 
 ## 源码
 
