@@ -1,7 +1,11 @@
-name: Windows CI
+name: Windows CI and Release
 
 on:
   push:
+    branches:
+      - '**'
+    tags:
+      - 'v*'
   pull_request:
   workflow_dispatch:
 
@@ -31,6 +35,31 @@ jobs:
         working-directory: EndfieldDataBridge
         shell: cmd
 
+      - name: Package build
+        id: package
+        shell: pwsh
+        working-directory: EndfieldDataBridge
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $tagVersion = $env:GITHUB_REF_NAME -replace '^v', ''
+            $productVersion = (Get-Item 'bin\EndfieldDataBridge.dll').VersionInfo.ProductVersion
+            if ($productVersion -ne $tagVersion) {
+              throw "Git tag version $tagVersion does not match DLL ProductVersion $productVersion"
+            }
+            $version = $env:GITHUB_REF_NAME
+          } else {
+            $version = "build-$env:GITHUB_RUN_NUMBER"
+          }
+
+          $archive = "EndfieldDataBridge-$version-windows-x64.zip"
+          $stage = Join-Path $env:RUNNER_TEMP 'EndfieldDataBridge-release'
+          $stageBin = Join-Path $stage 'bin'
+          New-Item -ItemType Directory -Force -Path $stageBin | Out-Null
+          Copy-Item 'bin\EndfieldDataBridge.dll', 'bin\efb_reader.exe' -Destination $stageBin
+          Copy-Item 'README.md', 'LICENSE' -Destination $stage
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $archive -CompressionLevel Optimal
+          "archive=$archive" >> $env:GITHUB_OUTPUT
+
       - name: Upload build outputs
         uses: actions/upload-artifact@v7
         with:
@@ -38,4 +67,26 @@ jobs:
           path: |
             EndfieldDataBridge/bin/EndfieldDataBridge.dll
             EndfieldDataBridge/bin/efb_reader.exe
+            EndfieldDataBridge/${{ steps.package.outputs.archive }}
           if-no-files-found: error
+
+  publish-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build-and-verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download packaged build
+        uses: actions/download-artifact@v8
+        with:
+          name: EndfieldDataBridge-windows-x64
+          path: release-assets
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: release-assets/EndfieldDataBridge-*-windows-x64.zip
+          generate_release_notes: true
+          fail_on_unmatched_files: true
