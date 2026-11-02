@@ -31,9 +31,11 @@ if errorlevel 1 exit /b 1
 if not exist bin\obj mkdir bin\obj
 if not exist bin\test mkdir bin\test
 
+rc /nologo /fo bin\version.res src\version.rc
+if errorlevel 1 exit /b 1
 cl /nologo /utf-8 /O2 /MT /LD /EHsc /std:c++17 /W4 /permissive- /wd4505 ^
     /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I"%APPLEPIE_DIR%\sdk" ^
-    src\*.cpp /Fo"bin\obj\\" /Fe:bin\EndfieldDataBridge.dll ^
+    src\*.cpp bin\version.res /Fo"bin\obj\\" /Fe:bin\EndfieldDataBridge.dll ^
     /link /INCREMENTAL:NO /MACHINE:X64
 if errorlevel 1 exit /b 1
 echo [OK] %CD%\bin\EndfieldDataBridge.dll
