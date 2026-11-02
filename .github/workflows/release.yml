@@ -1,0 +1,41 @@
+name: Windows CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-verify:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout EndfieldDataBridge
+        uses: actions/checkout@v7
+        with:
+          path: EndfieldDataBridge
+          persist-credentials: false
+
+      - name: Checkout ApplepieManager
+        uses: actions/checkout@v7
+        with:
+          repository: zonemodAE/ApplepieManager
+          path: ApplepieManager
+          persist-credentials: false
+
+      - name: Build and verify
+        run: .\build.bat /verify
+        working-directory: EndfieldDataBridge
+        shell: cmd
+
+      - name: Upload build outputs
+        uses: actions/upload-artifact@v7
+        with:
+          name: EndfieldDataBridge-windows-x64
+          path: |
+            EndfieldDataBridge/bin/EndfieldDataBridge.dll
+            EndfieldDataBridge/bin/efb_reader.exe
+          if-no-files-found: error
