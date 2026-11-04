@@ -88,8 +88,9 @@ void Print(const State& st) {
         st.buffsHead.count, st.units.size(), flags.empty() ? " -" : flags.c_str());
     if (status == efb::Status::WriterGone || status == efb::Status::Disabled) return;
     if (st.team.sampled_at)
-        std::printf("SP %.1f / %.1f  (per cell %d)  lock %u%s%s\n\n", st.team.atb, st.team.atb_max,
+        std::printf("SP %.1f / %.1f  (per cell %d)  lock %u%s%s%s\n\n", st.team.atb, st.team.atb_max,
             st.team.atb_per_cell, st.team.lock_target_uid, st.team.auto_lock ? " (auto)" : "",
+            st.team.in_fight ? "  IN FIGHT" : "",
             efb::Fresh(h, st.team.sampled_at, now) ? "" : "  [stale]");
     else
         std::printf("SP -\n\n");

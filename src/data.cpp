@@ -139,6 +139,7 @@ bool ResolveProbeOffsets(void** asms, size_t count) {
     off.bmLockTarget = FieldOffset(bm, "m_lockTarget"); // optional, with the two flags
     off.bmLockMode = FieldOffset(bm, "m_inLockTargetMode");
     off.bmAutoLock = FieldOffset(bm, "<isAutoLockTarget>k__BackingField");
+    off.bmInFight = FieldOffset(bm, "m_isSquadInFight"); // optional
     off.setPerCell = FieldOffset(setting, "atbPerCell");
     g_mGetBattleManager = FindMethodChecked(node, "get_battleManager", "Beyond.Gameplay.Core.BattleManager", {});
     g_mGetSkillSetting = FindMethodChecked(node, "get_skillSetting", "Beyond.Gameplay.SkillSetting", {});
@@ -258,6 +259,7 @@ int64_t g_teamSampledAt = 0;
 ULONGLONG g_lastAtbLog = 0;
 float g_lastAtb = -1, g_lastAtbMax = -1;
 uint32_t g_lastLock = 0;
+uint8_t g_lastInFight = 0;
 void ProbeAtb(void* node) {
     NoteThread("AtbNode.LateTick");
     const int64_t now = QpcNow();
@@ -275,9 +277,13 @@ void ProbeAtb(void* node) {
     team.lock_target_uid = locked ? lock.uid : 0;
     team.lock_mode = off.bmLockMode >= 0 && At<bool>(bm, off.bmLockMode);
     team.auto_lock = off.bmAutoLock >= 0 && At<bool>(bm, off.bmAutoLock);
+    team.in_fight = off.bmInFight >= 0 && At<bool>(bm, off.bmInFight);
     Write(W_TEAM, [&] { g_layout->team = team; });
     // The locked enemy is always in the units section, head bar or not.
     if (locked) SampleUnit(lock, SquadIndexOf(lock.object), false);
+    if (team.in_fight != g_lastInFight && ProbeLogAllowed())
+        LogF("[FIGHT] t=%llu in_fight=%d", GetTickCount64(), team.in_fight);
+    g_lastInFight = team.in_fight;
     if (team.lock_target_uid != g_lastLock && ProbeLogAllowed())
         LogF("[LOCK] t=%llu target=%u mode=%d auto=%d", GetTickCount64(), team.lock_target_uid, team.lock_mode,
             team.auto_lock);

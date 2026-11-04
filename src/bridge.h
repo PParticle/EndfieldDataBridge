@@ -216,7 +216,7 @@ struct Offsets {
     int dataIcon = -1, iconPath = -1, iconSquad = -1, iconHead = -1, iconMainOnly = -1;
     int asEntity = -1, asUid = -1, asUltSp = -1, asDanger = -1, asSkills = -1;
     int sqIndex = -1, sqMain = -1, sqAbility = -1, sqEmpty = -1;
-    int bmAtb = -1, bmAtbMax = -1, setPerCell = -1, bmLockTarget = -1, bmLockMode = -1, bmAutoLock = -1;
+    int bmAtb = -1, bmAtbMax = -1, setPerCell = -1, bmLockTarget = -1, bmLockMode = -1, bmAutoLock = -1, bmInFight = -1;
     int skillType = -1, skillOwner = -1, skillId = -1, entName = -1, hbTarget = -1;
     // AbilitySystem.m_poiseController -> PoiseController.m_poiseRecoverTimer -> PeriodicTimer
     int asPoiseCtl = -1, pcRecoverTimer = -1, ptRemaining = -1;

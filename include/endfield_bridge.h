@@ -1,4 +1,4 @@
-// EndfieldDataBridge shared memory (read-only for consumers), ABI 1.2.
+// EndfieldDataBridge shared memory (read-only for consumers), ABI 1.3.
 // include/endfield_bridge_reader.h implements every rule below.
 //
 // Mapping: EFB_MAPPING_NAME, EFB_MAPPING_SIZE bytes reserved, total_size used.
@@ -80,7 +80,7 @@
 #define EFB_MAPPING_SIZE (1u << 20)
 #define EFB_MAGIC 0x44424645u /* "EFBD" */
 #define EFB_ABI_MAJOR 1u
-#define EFB_ABI_MINOR 2u
+#define EFB_ABI_MINOR 3u
 #define EFB_NAME_LEN 64
 #define EFB_ID_LEN 96
 #define EFB_EVENT_PAYLOAD 128
@@ -95,6 +95,7 @@ enum EFB_SectionId {
 // EFB_Header.provides: optional data this writer could hook (since 1.1)
 #define EFB_PROVIDES_HEAD_BAR_UNITS 0x1u /* enemy head bar units in the units section */
 #define EFB_PROVIDES_SKILL_CASTS 0x2u    /* EFB_EVENT_SKILL_CAST_* events */
+#define EFB_PROVIDES_IN_FIGHT 0x4u       /* EFB_Team.in_fight (since 1.3) */
 // Beyond.Gameplay.SkillType
 enum EFB_SkillType { EFB_SKILL_PASSIVE = -1, EFB_SKILL_ATTACK = 0, EFB_SKILL_BREAKING_ATTACK = 1,
     EFB_SKILL_NORMAL = 2, EFB_SKILL_ATTACH = 3, EFB_SKILL_DODGE = 5, EFB_SKILL_COMBO = 6,
@@ -194,7 +195,8 @@ typedef struct EFB_Team {
     uint32_t lock_target_uid;  // BattleManager.lockTarget: the locked enemy, 0 = none; since 1.2
     uint8_t lock_mode;         // manual lock-on is active (BattleManager.inLockTargetMode); since 1.2
     uint8_t auto_lock;         // the target was chosen by auto lock (BattleManager.isAutoLockTarget); since 1.2
-    uint16_t reserved2;
+    uint8_t in_fight;          // the game's own combat state (BattleManager.m_isSquadInFight); since 1.3
+    uint8_t reserved2;
 } EFB_Team;
 
 typedef struct EFB_Operator {

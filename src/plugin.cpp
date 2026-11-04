@@ -332,6 +332,7 @@ APH_Result InstallProbes(void** asms, size_t count) {
              InstallProbe<CastEndHook>(end, 7, OnCastEnd, "void(self,i32,i32,Nullable slot,MethodInfo*)",
                  "Skill.CastEnd") == APH_OK)
         g_provides |= EFB_PROVIDES_SKILL_CASTS;
+    if (off.bmInFight >= 0) g_provides |= EFB_PROVIDES_IN_FIGHT;
     LogF("optional probes: provides=0x%x", g_provides);
     return APH_OK;
 }
